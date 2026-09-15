@@ -13,6 +13,18 @@ echo "  WHISPER_MODEL: $WHISPER_MODEL"
 echo "  PIPER_MODEL: $PIPER_MODEL"
 echo "  LLM_ENDPOINT: $LLM_ENDPOINT"
 
+# Check prerequisites
+echo ""
+echo "Checking prerequisites..."
+
+if ! aplay -l &>/dev/null; then
+    echo "WARNING: No ALSA devices found. Audio may not work."
+fi
+
+if ! arecord -L &>/dev/null; then
+    echo "WARNING: No microphone detected."
+fi
+
 if [ ! -f "$WHISPER_MODEL" ]; then
     echo "ERROR: Whisper model not found at $WHISPER_MODEL"
     echo "Please run: docker-compose run --rm voice-assistant ./install_models.sh"
@@ -25,11 +37,6 @@ if [ ! -f "$PIPER_MODEL" ]; then
     exit 1
 fi
 
-echo "Starting Piper TTS server on port 5000..."
-/app/piper --model "$PIPER_MODEL" --port 5000 --length-scale 1.0 &
-PIPER_PID=$!
-
-sleep 2
-
+echo ""
 echo "Starting voice assistant..."
 exec /app/voice-assistant

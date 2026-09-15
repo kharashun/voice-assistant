@@ -1,0 +1,33 @@
+# Go binary output
+voice-assistant
+
+# Build artifacts
+*.log
+build/
+dist/
+
+# Models (runtime mounted, 75-150MB)
+models/
+*.bin
+*.onnx
+
+# Voices directory
+voices/
+
+# Test audio files
+*.wav
+*.mp3
+
+# Logs
+*.log
+logs/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

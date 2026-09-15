@@ -6,10 +6,9 @@ A low-latency voice assistant with speech-to-text (STT), LLM processing, and tex
 
 - **Speech-to-Text**: whisper.cpp (CPU, tiny.en model)
 - **LLM Processing**: Calls local llama.cpp API
-- **Text-to-Speech**: piper (high-quality, fast)
-- **Total Latency**: 2-3 seconds
-- **Audio Capture**: Uses `sox` (rec command)
-
+- **Text-to-Speech**: piper (high-quality, fast, CLI mode)
+- **Total Latency**: 2-3 seconds (target)
+- **SoX**: Single command for 16kHz WAV capture (50-100ms faster than arecord+ffmpeg)
 ## Architecture
 
 ```
@@ -18,9 +17,9 @@ Host (Ubuntu)
 ├── Speaker (ALSA)
 └── llama.cpp API (localhost:8080, EXTERNAL)
     └── Docker Container
-        ├── orchestrator.go (main logic)
+        ├── voice-assistant (Go orchestrator)
         ├── whisper-cli (STT, CPU)
-        └── piper (TTS, CLI)
+        └── piper (TTS, CLI mode)
 ```
 
 ## Prerequisites
@@ -82,6 +81,7 @@ Environment variables:
 ### Build locally
 
 ```bash
+sudo apt install sox alsa-utils
 go build -o voice-assistant orchestrator.go
 ./voice-assistant
 ```
@@ -96,9 +96,9 @@ docker-compose build --no-cache
 
 ### No audio device found
 
-Ensure ALSA is configured on the host:
+Ensure ALSA and SoX are configured on the host:
 ```bash
-sudo apt install alsa-utils
+sudo apt install alsa-utils sox
 ```
 
 ### Model not found
@@ -115,6 +115,12 @@ Ensure llama.cpp is running on `localhost:8080`:
 docker run -p 8080:8080 -v /path/to/model:/model ggerganov/llama.cpp:server -m /model/ggml-model.bin
 ```
 
-## License
+## Licenses
 
-MIT
+Voice Assistant: MIT
+
+### Third-party Licenses
+
+- **SoX**: GPL-2.0-or-later (see [LICENSES/LICENSE.GPL-2.0](LICENSES/LICENSE.GPL-2.0))
+- **Piper**: GPL-3.0 (see [LICENSES/LICENSE.GPL-3.0](LICENSES/LICENSE.GPL-3.0))
+- **Whisper.cpp**: MIT (see [LICENSES/LICENSE.MIT-whisper](LICENSES/LICENSE.MIT-whisper))

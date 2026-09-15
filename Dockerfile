@@ -46,7 +46,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
     libasound2 \
     libpulse0 \
-    ffmpeg \
+    sox \
     espeak-ng \
     python3 \
     wget \
@@ -58,17 +58,9 @@ WORKDIR /app
 # Copy binaries from builder
 COPY --from=builder /workspace/whisper-cli /app/whisper-cli
 COPY --from=builder /workspace/voice-assistant /app/voice-assistant
-COPY --from=builder /workspace/piper /app/piper
-
-COPY go.mod /app/
-RUN go mod download
-
-COPY orchestrator.go /app/
-RUN go build -o voice-assistant orchestrator.go
+COPY --from=builder /usr/local/bin/piper /app/piper
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
-
-EXPOSE 5000
 
 ENTRYPOINT ["/entrypoint.sh"]

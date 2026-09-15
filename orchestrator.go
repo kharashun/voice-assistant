@@ -46,19 +46,19 @@ func debugLog(msg string) {
 }
 
 func captureAudio(config *Config) ([]byte, error) {
-	// Use ffmpeg to capture from ALSA device
-	// Record for up to 5 seconds or until silence detected
+	// Use sox to capture from ALSA device directly to 16kHz WAV
+	tmpFile := fmt.Sprintf("/tmp/%d.wav", time.Now().UnixNano())
+	defer os.Remove(tmpFile)
+
 	cmd := exec.Command(
-		"ffmpeg",
-		"-y", // overwrite without asking
-		"-f", "alsa",
-		"-i", "default",
-		"-t", "5",
-		"-af", "silencedetect=noise=-30dB:d=0.5",
-		"-ar", "16000",
-		"-ac", "1",
-		"-f", "wav",
-		"-",
+		"sox",
+		"-d",           // default audio device
+		"-r", "16000",  // 16kHz sample rate
+		"-c", "1",      // mono
+		"-b", "16",     // 16-bit
+		"-t", "wav",    // WAV format
+		tmpFile,        // output file
+		"trim", "0", "5", // trim: start at 0, duration 5 seconds
 	)
 
 	output, err := cmd.CombinedOutput()
@@ -66,30 +66,14 @@ func captureAudio(config *Config) ([]byte, error) {
 		return nil, fmt.Errorf("failed to capture audio: %w, output: %s", err, string(output))
 	}
 
-	// Extract just the audio data (skip stderr from silencedetect)
-	var wavData []byte
-	// The output contains both audio and silence detection info
-	// We need to parse it properly - for now, use a simpler approach
-	// by piping through ffmpeg properly
-
-	// Alternative: Use arecord + sox for cleaner audio capture
-	cmd2 := exec.Command("arecord", "-D", "default", "-f", "cd", "-t", "raw", "-d", "5", "-")
-	output2, err := cmd2.CombinedOutput()
+	wavData, err := os.ReadFile(tmpFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to record audio: %w, output: %s", err, string(output2))
+		return nil, fmt.Errorf("failed to read audio file: %w", err)
 	}
 
-	// Convert raw to 16kHz WAV using ffmpeg
-	cmd3 := exec.Command("ffmpeg", "-y", "-f", "s16le", "-ar", "44100", "-ac", "1", "-i", "-", "-ar", "16000", "-ac", "1", "-f", "wav", "-")
-	cmd3.Stdin = bytes.NewReader(output2)
-	wavOutput, err := cmd3.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert audio: %w, output: %s", err, string(wavOutput))
-	}
+	debugLog(fmt.Sprintf("Captured %d bytes of audio", len(wavData)))
 
-	debugLog(fmt.Sprintf("Captured %d bytes of audio", len(wavOutput)))
-
-	return wavOutput, nil
+	return wavData, nil
 }
 
 func sttWithWhisper(wavData []byte, config *Config) (string, error) {

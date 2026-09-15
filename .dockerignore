@@ -1,0 +1,32 @@
+# Git
+.git
+.gitignore
+
+# Documentation
+*.md
+!LICENSE
+!LICENSES
+*.txt
+
+# Build outputs
+build/
+dist/
+*.log
+
+# Models (should be mounted at runtime)
+models/
+*.bin
+*.onnx
+
+# Build outputs
+build/
+dist/
+*.log
+
+# Models (should be mounted at runtime)
+models/
+*.bin
+*.onnx
+
+# Voices (if any)
+voices/
