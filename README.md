@@ -65,6 +65,24 @@ Environment variables (all optional, see AGENTS.md for the full table):
 - `CAPTURE_SECONDS`: Fixed capture window in seconds (default: `5`)
 - `DEBUG`: Enable debug logging (default: `false`)
 
+### Changing the LLM endpoint
+
+The llama.cpp endpoint can be overridden without editing any files, either
+via a host environment variable:
+
+```bash
+LLM_ENDPOINT=http://192.168.1.50:8080 docker compose up
+```
+
+or via a `.env` file in the project directory (Docker Compose loads it
+automatically):
+
+```bash
+cp .env.example .env
+# edit LLM_ENDPOINT in .env, then:
+docker compose up
+```
+
 ## Models
 
 | Model | Size | Description |
@@ -111,10 +129,11 @@ Run the install script:
 ```bash
 docker compose run --rm voice-assistant /app/install_models.sh
 ```
-
 ### LLM connection failed
 
-Ensure llama.cpp is running on `localhost:8080`:
+Ensure llama.cpp is running on `localhost:8080` (or whatever `LLM_ENDPOINT`
+points to):
+
 ```bash
 docker run -p 8080:8080 -v /path/to/model:/model ggerganov/llama.cpp:server -m /model/gguf
 ```

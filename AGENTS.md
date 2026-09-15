@@ -67,7 +67,7 @@ docker compose up -d
 |----------|---------|-------------|
 | `WHISPER_MODEL` | `/models/whisper/ggml-tiny.en.bin` | Path to whisper model |
 | `PIPER_MODEL` | `/models/piper/en_US-lessac-medium.onnx` | Path to piper model |
-| `LLM_ENDPOINT` | `http://127.0.0.1:8080` | LLM API endpoint (host network mode) |
+| `LLM_ENDPOINT` | `http://127.0.0.1:8080` | LLM API endpoint (host network mode); overridable via host env var or `.env` file |
 | `LLM_TIMEOUT` | `30s` | LLM request timeout (Go duration) |
 | `CAPTURE_SECONDS` | `5` | Fixed audio capture window in seconds |
 | `WHISPER_BIN` | `/app/whisper-cli` | whisper-cli binary path |
@@ -144,6 +144,7 @@ voice-assistant/
 ├── PERFORMANCE_IMPROVEMENTS.md# Optimization plan
 ├── LICENSES/                  # Third-party licenses
 ├── .dockerignore              # Docker ignore file
+├── .env.example               # Template for .env overrides (LLM_ENDPOINT)
 └── models/                    # Mount point for models (host ./models)
     ├── whisper/
     └── piper/
@@ -182,6 +183,9 @@ voice-assistant/
 - Host network mode (`network_mode: host`) - the llama.cpp server on the
   host is reached via `http://127.0.0.1:8080` (`host.docker.internal` is NOT
   resolvable in host network mode on Linux)
+- `LLM_ENDPOINT` is passed through in docker-compose.yml as
+  `${LLM_ENDPOINT:-http://127.0.0.1:8080}`, so it can be overridden via a
+  host env var or a `.env` file (see `.env.example`)
 - /dev/snd passthrough for ALSA audio
 - Volume mounts for models
 - Entrypoint passes through any command given via

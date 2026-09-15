@@ -22,6 +22,9 @@ voices/
 *.log
 logs/
 
+# Local environment overrides (keep .env.example tracked)
+.env
+
 # Editor/IDE
 .vscode/
 .idea/
