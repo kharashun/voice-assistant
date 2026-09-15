@@ -10,28 +10,33 @@ if ! command -v docker &> /dev/null; then
     exit 1
 fi
 
-if ! command -v docker-compose &> /dev/null; then
+# Prefer Docker Compose v2 (plugin), fall back to the legacy v1 binary
+if docker compose version &> /dev/null; then
+    COMPOSE="docker compose"
+elif command -v docker-compose &> /dev/null; then
+    COMPOSE="docker-compose"
+else
     echo "ERROR: Docker Compose is not installed"
     exit 1
 fi
 
 echo "Step 1: Building Docker image..."
-docker-compose build
+$COMPOSE build
 
 echo ""
 echo "Step 2: Installing models..."
-docker-compose run --rm voice-assistant ./install_models.sh
+$COMPOSE run --rm voice-assistant /app/install_models.sh
 
 echo ""
 echo "Step 3: Starting voice assistant..."
-docker-compose up -d
+$COMPOSE up -d
 
 echo ""
 echo "Step 4: Checking status..."
 sleep 2
-docker-compose ps
+$COMPOSE ps
 
 echo ""
 echo "=== Voice Assistant Started ==="
-echo "View logs: docker-compose logs -f"
-echo "Stop: docker-compose down"
+echo "View logs: $COMPOSE logs -f"
+echo "Stop: $COMPOSE down"

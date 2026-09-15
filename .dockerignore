@@ -4,26 +4,16 @@
 
 # Documentation
 *.md
-!LICENSE
-!LICENSES
 *.txt
+LICENSES
 
 # Build outputs
 build/
 dist/
 *.log
+voice-assistant
 
-# Models (should be mounted at runtime)
-models/
-*.bin
-*.onnx
-
-# Build outputs
-build/
-dist/
-*.log
-
-# Models (should be mounted at runtime)
+# Models (mounted at runtime, not part of the build context)
 models/
 *.bin
 *.onnx

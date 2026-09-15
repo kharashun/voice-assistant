@@ -2,7 +2,7 @@
 
 ## Current State
 
-- **Total latency target**: 2-3 seconds
+- **Total latency target**: fixed capture window (default 5s) + 2-3s processing
 - **Current bottleneck**: LLM inference (1-2 seconds)
 - **CPU**: 4 cores (can leverage multi-threading)
 - **User**: Single user (sequential processing)
@@ -19,8 +19,8 @@
 
 Currently used via:
 ```bash
-arecord -D default -f cd -t raw -d 5 -  # Capture
-aplay -q /tmp/output.wav                 # Playback
+sox -d -r 16000 -c 1 -b 16 -t wav output.wav trim 0 5   # Capture
+aplay -q /tmp/output.wav                                 # Playback
 ```
 
 ---
@@ -28,55 +28,18 @@ aplay -q /tmp/output.wav                 # Playback
 ## Optimization Opportunities
 
 ### 1. Audio Capture Optimization
-**Current**: `arecord → ffmpeg` (two-process pipeline)
-**Issue**: Process chain overhead
-
-**Improvement**:
-```bash
-# Use sox single command
-sox -d -r 16000 -c 1 -b 16 output.wav trim 0 5
-```
-
-**Benefits**:
-- Reduce process chain from 2 → 1
-- Estimated gain: **~50-100ms**
-
-**Code Change** (`orchestrator.go`):
-```go
-// Replace arecord+ffmpeg pipeline with sox
-cmd := exec.Command("sox", "-d", "-r", "16000", "-c", "1", "-b", "16",
-    "-t", "wav", tmpFile, "trim", "0", "5")
-```
+**Current**: `sox -d` (single-process capture, was arecord+ffmpeg before)
+**Status**: **DONE** - `sox -d -r 16000 -c 1 -b 16 -t wav <file> trim 0 <secs>`
+is implemented in `captureAudio` (window configurable via `CAPTURE_SECONDS`).
 
 ---
 
 ### 2. Whisper Configuration
-**Current**: Default settings (likely single-threaded)
+**Current**: Default settings - whisper-cli already defaults to 4 threads,
+and the Release build with the tiny.en model is in place.
 
-**Improvement**:
-```bash
-./whisper-cli -m model.bin -f audio.wav -otxt -pc -t 4
-#                                          ^^^^ add threads
-```
-
-**Benefits**:
-- Use all 4 CPU cores
-- Estimated gain: **~100-200ms**
-
-**Configuration** (`orchestrator.go`):
-```go
-cmd := exec.Command(
-    "/app/whisper-cli",
-    "-m", config.WhisperModel,
-    "-f", tmpFile,
-    "-otxt",
-    "-pc",
-    "-t", "4",  // Add: use 4 threads
-)
-```
-
-**Model Options**:
-- `ggml-tiny.en.bin` (75MB) - current, fast but less accurate
+**Note**: `-t 4` is the whisper-cli default, so no change is needed for
+thread count. Remaining options are model upgrades:
 - `ggml-base.en.bin` (146MB) - better accuracy, moderate speed
 - `ggml-medium.en.bin` (388MB) - best accuracy, slower (~2x)
 - `ggml-tiny.en-q5_0.bin` (75MB quantized) - same size, slightly faster
@@ -84,41 +47,19 @@ cmd := exec.Command(
 ---
 
 ### 3. LLM Request Optimization
-**Current**: Basic `http.Post` without timeout
-
-**Improvement**:
-```go
-client := &http.Client{
-    Timeout: 2 * time.Second,  // Prevent hangs
-    Transport: &http.Transport{
-        MaxIdleConns: 10,        // Connection pooling
-    },
-}
-```
-
-**Benefits**:
-- Prevents stuck requests
-- Better resource management
-- Estimated gain: **stability improvement**
+**Current**: `http.Client` with a configurable timeout (`LLM_TIMEOUT`,
+default 30s) and an HTTP status-code check
+**Status**: **DONE** - prevents hangs; stuck requests fail fast.
 
 ---
 
 ### 4. Piper TTS Optimization
-**Current**: CLI mode with file I/O (write → read → delete)
+**Current**: CLI mode with file I/O (text in via stdin, WAV out via
+`--output-file`). Note: there is NO piper HTTP server in this setup and
+never was one in `entrypoint.sh`; piper is invoked per call as a CLI.
 
-**Improvement 1: HTTP Server Mode**
-```bash
-# Start Piper as HTTP server (already in entrypoint.sh)
-/app/piper --model model.onnx --port 5000 --length-scale 1.0
-
-# Use HTTP instead of CLI
-curl -X POST http://localhost:5000/api/tts -d '{"text":"hello"}'
-```
-
-**Improvement 2: stdin/stdout streaming**
-```bash
-echo "hello" | /app/piper --model model.onnx --output-file -
-```
+**Possible improvement**: an in-memory stdout streaming mode if a future
+piper version gains it (the current C++ CLI writes a WAV file).
 
 **Benefits**:
 - Avoid file I/O overhead
@@ -197,10 +138,10 @@ go func() {
 ### Phase 1: Quick Wins (0-1 day) - **HIGH PRIORITY**
 | Task | Effort | Impact | Status |
 |------|--------|--------|--------|
-| Add `-t 4` to whisper | 2 min | +100ms | [ ] |
-| Add HTTP timeout to LLM | 5 min | Stability | [ ] |
-| Use sox instead of arecord+ffmpeg | 30 min | +50ms | [ ] |
-| Add model existence check at startup | 10 min | UX | [ ] |
+| ~~Add `-t 4` to whisper~~ (default is already 4 threads) | - | - | [x] N/A |
+| Add HTTP timeout + status check to LLM | 5 min | Stability | [x] |
+| Use sox instead of arecord+ffmpeg | 30 min | +50ms | [x] |
+| Add model existence check at startup | 10 min | UX | [x] |
 
 ### Phase 2: Model Upgrade (1-2 days) - **MEDIUM PRIORITY**
 | Task | Effort | Impact | Status |
@@ -212,9 +153,9 @@ go func() {
 ### Phase 3: Piper Streaming (2-3 days) - **MEDIUM PRIORITY**
 | Task | Effort | Impact | Status |
 |------|--------|--------|--------|
-| Switch to Piper HTTP server mode | 1 hour | +100-150ms | [ ] |
-| Stream text directly (no file I/O) | 2 hours | +50ms | [ ] |
-| Test audio quality | 30 min | Validation | [ ] |
+| Switch to Piper HTTP server mode | 1 hour | +100-150ms | [ ] (not implemented; CLI used) |
+| Stream text directly (no file I/O) | 2 hours | +50ms | [x] text via stdin; WAV still file-based |
+| Test audio quality | 30 min | Validation | [x] | |
 
 ### Phase 4: Pipeline Overlap (3-5 days) - **MEDIUM PRIORITY**
 | Task | Effort | Impact | Status |

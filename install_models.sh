@@ -4,31 +4,39 @@ set -e
 
 echo "=== Installing Voice Assistant Models ==="
 
-mkdir -p models/whisper models/piper
+# Models live in the /models volume inside the container (./models on the
+# host). MODELS_DIR can be overridden for local (non-Docker) use.
+MODELS_DIR="${MODELS_DIR:-/models}"
+WHISPER_MODEL_NAME="ggml-tiny.en.bin"
+PIPER_MODEL_NAME="en_US-lessac-medium.onnx"
+PIPER_VOICE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium"
+
+mkdir -p "$MODELS_DIR/whisper" "$MODELS_DIR/piper"
 
 echo "Downloading Whisper tiny.en model..."
-if [ ! -f models/whisper/ggml-tiny.en.bin ]; then
-    wget -q --show-progress -O models/whisper/ggml-tiny.en.bin \
-        https://raw.githubusercontent.com/ggerganov/whisper.cpp/master/models/ggml-tiny.en.bin
+if [ ! -f "$MODELS_DIR/whisper/$WHISPER_MODEL_NAME" ]; then
+    wget -q --show-progress -O "$MODELS_DIR/whisper/$WHISPER_MODEL_NAME" \
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$WHISPER_MODEL_NAME"
 else
     echo "Whisper model already exists, skipping"
 fi
 
 echo "Downloading Piper English model..."
-if [ ! -f models/piper/en_US-lessac-medium.onnx ]; then
-    mkdir -p models/piper
-    wget -q --show-progress -O models/piper/en_US-lessac-medium.onnx \
-        https://github.com/rhasspy/piper/releases/download/v1.2.0/en_US-lessac-medium.onnx
-    
-    wget -q --show-progress -O models/piper/en_US-lessac-medium.onnx.json \
-        https://github.com/rhasspy/piper/releases/download/v1.2.0/en_US-lessac-medium.onnx.json
+if [ ! -f "$MODELS_DIR/piper/$PIPER_MODEL_NAME" ]; then
+    wget -q --show-progress -O "$MODELS_DIR/piper/$PIPER_MODEL_NAME" \
+        "$PIPER_VOICE_URL/$PIPER_MODEL_NAME"
 else
     echo "Piper model already exists, skipping"
 fi
 
+# The .onnx.json voice config is small; always (re)download it so a partial
+# earlier download heals itself.
+wget -q --show-progress -O "$MODELS_DIR/piper/$PIPER_MODEL_NAME.json" \
+    "$PIPER_VOICE_URL/$PIPER_MODEL_NAME.json"
+
 echo ""
 echo "=== Models Installed ==="
-echo "Whisper: models/whisper/ggml-tiny.en.bin"
-echo "Piper:   models/piper/en_US-lessac-medium.onnx"
+echo "Whisper: $MODELS_DIR/whisper/$WHISPER_MODEL_NAME"
+echo "Piper:   $MODELS_DIR/piper/$PIPER_MODEL_NAME (+ .json)"
 echo ""
-echo "You can now run: docker-compose up -d"
+echo "You can now run: docker compose up -d"

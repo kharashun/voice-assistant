@@ -11,33 +11,30 @@ A low-latency voice assistant system for Ubuntu with speech-to-text (STT), LLM p
 │                     HOST MACHINE (Ubuntu)                    │
 │                                                              │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │  Microphone  │    │  Speaker   │    │  llama.cpp   │  │
-│  │  (ALSA)      │    │  (ALSA)    │    │  Port 8080   │  │
+│  │  Microphone  │    │  Speaker     │    │  llama.cpp   │  │
+│  │  (ALSA)      │    │  (ALSA)      │    │  Port 8080   │  │
 │  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘  │
 │         │                   │                   │           │
-│         │                   │                   │           │
-│         ▼                   ▼                   │           │
-│  ┌─────────────────────────────────────────────▼───────────┐ │
-│  │              Docker Container (Combined)                │ │
-│  │                                                         │ │
-│  │  ┌─────────────────────────────────────────────────┐   │ │
-│  │  │  voice-assistant (Go Orchestrator)              │   │ │
-│  │  │  - Audio capture (ffmpeg/arecord)               │   │ │
-│  │  │  - Whisper STT integration                      │   │ │
-│  │  │  - LLM API calls (port 8080)                    │   │ │
-│  │  │  - Piper TTS integration                        │   │ │
-│  │  │  - Audio playback (aplay)                       │   │ │
-│  │  └─────────────────────────────────────────────────┘   │ │
-│  │                  │           │           │              │ │
-│  │                  ▼           ▼           ▼              │ │
-│  │        ┌─────────────┐ ┌───────┐ ┌───────────┐         │ │
-│  │        │ whisper-cli │ │piper  │ │   piper   │         │ │
-│  │        │ (STT)       │ │server │ │  (TTS)    │         │ │
-│  │        └─────────────┘ │port   │ └───────────┘         │ │
-│  │                        │5000   │                       │ │
-│  │                        └───────┘                       │ │
-│  └─────────────────────────────────────────────────────────┘ │
-└───────────────────────────────────────────────────────────────┘
+│         ▼                   ▼                   ▼           │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │        Docker Container (Combined, host network)    │   │
+│  │                                                     │   │
+│  │  ┌─────────────────────────────────────────────┐   │   │
+│  │  │  voice-assistant (Go Orchestrator)          │   │   │
+│  │  │  - Audio capture (sox, single process)      │   │   │
+│  │  │  - Whisper STT integration                  │   │   │
+│  │  │  - LLM API calls (127.0.0.1:8080)           │   │   │
+│  │  │  - Piper TTS integration (text via stdin)   │   │   │
+│  │  │  - Audio playback (aplay)                   │   │   │
+│  │  └─────────────────────────────────────────────┘   │   │
+│  │                  │           │                       │   │
+│  │                  ▼           ▼                       │   │
+│  │        ┌─────────────┐ ┌───────┐                     │   │
+│  │        │ whisper-cli │ │ piper │  (CLI mode only)   │   │
+│  │        │ (STT)       │ │ (TTS) │                    │   │
+│  │        └─────────────┘ └───────┘                     │   │
+│  └─────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ## Component Specifications
@@ -45,13 +42,13 @@ A low-latency voice assistant system for Ubuntu with speech-to-text (STT), LLM p
 ### 1. Go Orchestrator (`orchestrator.go`)
 
 **Responsibilities:**
-- Capture audio from host microphone via ALSA
-- Convert audio to 16kHz WAV format
+- Capture audio from the host microphone via ALSA (sox, single process)
 - Pass audio to whisper-cli for STT
-- Parse STT output and send to LLM API
-- Parse LLM response and send to piper
-- Play audio to host speaker
-- Measure and report total latency
+- Parse STT output (read the `-of <base> -otxt` file, never parse log output)
+  and send it to the LLM API
+- Parse LLM response and send it to piper via stdin
+- Play audio to the host speaker
+- Measure and report total latency (including the capture window)
 
 **Audio Pipeline:**
 ```go
@@ -59,68 +56,81 @@ captureAudio() → sttWithWhisper() → callLLM() → ttsWithPiper() → playAud
 ```
 
 **API Integration:**
-- LLM endpoint: `http://host.docker.internal:8080/completion`
-- Piper endpoint: `/app/piper` (CLI mode for low latency)
+- LLM endpoint: `http://127.0.0.1:8080/completion` (container runs in host
+  network mode; `host.docker.internal` is not resolvable there on Linux)
+- Piper: `/app/piper` (CLI mode; text is written to its stdin, output WAV is
+  written via `--output-file`)
 
 **Configuration:**
 ```go
 type Config struct {
-    WhisperModel string   // WHISPER_MODEL env var
-    PiperModel   string   // PIPER_MODEL env var
-    LLMEndpoint  string   // LLM_ENDPOINT env var
-    Debug        bool     // DEBUG env var
+    WhisperBin     string        // WHISPER_BIN env var
+    WhisperModel   string        // WHISPER_MODEL env var
+    PiperBin       string        // PIPER_BIN env var
+    PiperModel     string        // PIPER_MODEL env var
+    EspeakData     string        // ESPEAK_DATA env var
+    LLMEndpoint    string        // LLM_ENDPOINT env var
+    LLMTimeout     time.Duration // LLM_TIMEOUT env var
+    CaptureSeconds int           // CAPTURE_SECONDS env var
+    Debug          bool          // DEBUG env var
 }
 ```
 
 ### 2. whisper.cpp (STT)
 
-**Source:** ggml-org/whisper.cpp
-**Build:** Compiled from source with FFmpeg support
+**Source:** ggml-org/whisper.cpp (pinned v1.9.4)
+**Build:** Compiled from source, statically linked (`BUILD_SHARED_LIBS=OFF`),
+no SDL2, no FFmpeg (input is a plain 16kHz WAV produced by sox)
 **Model:** ggml-tiny.en.bin (75MB)
 **Mode:** CLI mode for lowest overhead
 **CPU Only:** No GPU acceleration
 
 **Command:**
 ```bash
-./whisper-cli -m /models/whisper/ggml-tiny.en.bin -f /tmp/input.wav -otxt -pc
+./whisper-cli -m /models/whisper/ggml-tiny.en.bin -f /tmp/input.wav \
+    -of /tmp/input -otxt
+# transcript is then read from /tmp/input.txt
 ```
 
 ### 3. piper (TTS)
 
-**Source:** OHF-Voice/piper1-gpl
-**Build:** Installed via pip, compiled from source
-**Model:** en_US-lessac-medium.onnx (150MB)
-**Mode:** CLI mode (no HTTP server in combined container)
+**Source:** OHF-Voice/piper1-gpl (pinned v1.8.0)
+**Build:** The C++ CLI (`libpiper/src/main/piper_exe`) built from source with
+cmake; espeak-ng is built as a static dependency, onnxruntime is fetched as a
+prebuilt shared library
+**Model:** en_US-lessac-medium.onnx (63MB) + .onnx.json config
+**Mode:** CLI mode only (no HTTP server)
 
 **Command:**
 ```bash
-/app/piper --model /models/piper/en_US-lessac-medium.onnx \
-           --input-text "Hello world" \
-           --output-file /tmp/output.wav \
-           --sample-rate 22050
+echo "Hello world" | /app/piper \
+    --model /models/piper/en_US-lessac-medium.onnx \
+    --espeak-data /opt/espeak-ng-data \
+    --output-file /tmp/output.wav
 ```
+
+Note: piper has no `--input-text` or `--sample-rate` options; text is read
+from stdin and the WAV is written at the voice's native sample rate.
 
 ## Docker Configuration
 
 ### Docker Compose (`docker-compose.yml`)
 
 ```yaml
-version: '3.8'
-
 services:
   voice-assistant:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: voice-assistant
-    network_mode: host  # Access host llama.cpp API
+    network_mode: host  # Access host llama.cpp API via 127.0.0.1:8080
     volumes:
-      - ./models:/models:ro        # Read-only model mount
-      - /dev/snd:/dev/snd          # Audio device passthrough
+      - ./models:/models          # Model mount
+      - /dev/snd:/dev/snd         # Audio device passthrough
     environment:
       - WHISPER_MODEL=/models/whisper/ggml-tiny.en.bin
       - PIPER_MODEL=/models/piper/en_US-lessac-medium.onnx
-      - LLM_ENDPOINT=http://host.docker.internal:8080
+      - LLM_ENDPOINT=http://127.0.0.1:8080
       - DEBUG=false
     devices:
       - /dev/snd:/dev/snd
@@ -133,28 +143,27 @@ services:
 
 **Multi-stage build:**
 
-1. **Builder stage:**
-   - Install build dependencies (cmake, sox, alsa, etc.)
-   - Clone and build whisper.cpp
-   - Clone and build piper
+1. **Builder stage (golang:1.23-bookworm):**
+   - Install build dependencies (cmake ≥3.26 via PyPI, ninja, build-essential)
+   - Clone and build whisper.cpp (static, no SDL2/FFmpeg)
+   - Clone and build piper's C++ CLI from libpiper
    - Build Go orchestrator
 
-2. **Runtime stage:**
-   - Install runtime dependencies
-   - Copy binaries from builder
-   - Copy entrypoint script
-   - Set entrypoint
-
-**Base image:** `golang:1.22-bookworm` (builder), `debian:bookworm-slim` (runtime)
+2. **Runtime stage (debian:bookworm-slim):**
+   - Install runtime dependencies (alsa-utils, sox + ALSA format plugin,
+     libgomp1, libstdc++6)
+   - Copy binaries (whisper-cli, voice-assistant, piper), shared libraries
+     (libpiper.so, libonnxruntime.so → /usr/local/lib + ldconfig) and
+     espeak-ng data (/opt/espeak-ng-data)
+   - Copy entrypoint + model install scripts
+   - ENTRYPOINT + CMD (the entrypoint passes through any command)
 
 ## Audio I/O Implementation
 
 ### Capture (`captureAudio`)
 ```bash
-# Method 1: Using arecord + ffmpeg
-arecord -D default -f cd -t raw -d 5 - | \
-    ffmpeg -y -f s16le -ar 44100 -ac 1 -i - \
-             -ar 16000 -ac 1 -f wav -
+# Single process: record the default ALSA device as 16kHz mono 16-bit WAV
+sox -d -r 16000 -c 1 -b 16 -t wav /tmp/input.wav trim 0 5
 ```
 
 ### Playback (`playAudio`)
@@ -166,17 +175,23 @@ aplay -q /tmp/output.wav
 
 | Component | Target | Actual (estimated) | Notes |
 |-----------|--------|-------------------|-------|
-| Whisper STT | <500ms | 300-600ms | tiny.en model, 4 threads |
-| LLM inference | <1500ms | 1-2s | 3B model on GPU |
-| Piper TTS | <500ms | 200-400ms | CLI mode, no HTTP |
-| Audio I/O | <200ms | 100-200ms | Capture + playback |
-| **Total** | <3s | 2.5-3.5s | Dependent on models |
+| Audio capture | fixed 5s window | 5s | `CAPTURE_SECONDS`, no VAD |
+| Whisper STT | <500ms | 300-600ms | tiny.en model, Release build |
+| LLM inference | <1500ms | 1-2s | depends on model/hardware |
+| Piper TTS | <500ms | 200-400ms | CLI mode, model loaded per call |
+| Playback | <200ms | 100-200ms | aplay |
+| **Total** | 5s + <3s | 6.5-8s | includes the fixed capture window |
 
 ## Model Download (`install_models.sh`)
 
-Downloads models at runtime:
-- Whisper: `ggml-tiny.en.bin` (75MB)
-- Piper: `en_US-lessac-medium.onnx` + `.json` (150MB)
+Downloads models at runtime into the `/models` volume (mounted from `./models`):
+- Whisper: `ggml-tiny.en.bin` (75MB) from HuggingFace (ggerganov/whisper.cpp)
+- Piper: `en_US-lessac-medium.onnx` (63MB) + `.onnx.json` (5KB) from
+  HuggingFace (rhasspy/piper-voices)
+
+```bash
+docker compose run --rm voice-assistant /app/install_models.sh
+```
 
 ## Configuration
 
@@ -186,7 +201,12 @@ Downloads models at runtime:
 |----------|---------|-------------|
 | `WHISPER_MODEL` | `/models/whisper/ggml-tiny.en.bin` | Whisper model path |
 | `PIPER_MODEL` | `/models/piper/en_US-lessac-medium.onnx` | Piper model path |
-| `LLM_ENDPOINT` | `http://host.docker.internal:8080` | LLM API URL |
+| `LLM_ENDPOINT` | `http://127.0.0.1:8080` | LLM API URL |
+| `LLM_TIMEOUT` | `30s` | LLM request timeout (Go duration) |
+| `CAPTURE_SECONDS` | `5` | Fixed capture window |
+| `WHISPER_BIN` | `/app/whisper-cli` | whisper-cli binary path |
+| `PIPER_BIN` | `/app/piper` | piper binary path |
+| `ESPEAK_DATA` | `/opt/espeak-ng-data` | espeak-ng data dir |
 | `DEBUG` | `false` | Enable debug logging |
 
 ### Log Output
@@ -194,11 +214,16 @@ Downloads models at runtime:
 ```bash
 # Normal operation
 Voice Assistant ready! Press Ctrl+C to exit.
-Listening... Processing...
+Listening... (5s window)
+Processing...
 You said: Hello how are you
 Assistant: I'm doing great, thank you!
 Speaking...
-Total latency: 2.3s
+Capture: 5.1s | STT+LLM+TTS+playback: 2.3s | Total: 7.4s
+
+# Silence (whisper writes "[BLANK_AUDIO]")
+You said: [BLANK_AUDIO]
+No speech detected. Listening again...
 
 # Debug mode (DEBUG=true)
 [DEBUG] Captured 160000 bytes of audio
@@ -223,21 +248,21 @@ Total latency: 2.3s
 ./start.sh
 
 # Or manual start
-docker-compose build
-docker-compose run --rm voice-assistant ./install_models.sh
-docker-compose up -d
+docker compose build
+docker compose run --rm voice-assistant /app/install_models.sh
+docker compose up -d
 ```
 
 ### Stopping
 
 ```bash
-docker-compose down
+docker compose down
 ```
 
 ### Logs
 
 ```bash
-docker-compose logs -f voice-assistant
+docker compose logs -f voice-assistant
 ```
 
 ## Development
@@ -245,20 +270,24 @@ docker-compose logs -f voice-assistant
 ### Local Build (without Docker)
 
 ```bash
-# Install dependencies
-sudo apt install sox libsox-fmt-all alsa-utils
+# Install dependencies (sox needs the ALSA format plugin)
+sudo apt install sox libsox-fmt-alsa alsa-utils
 
 # Build orchestrator
 go build -o voice-assistant orchestrator.go
 
-# Run
+# Run with local paths/models
+WHISPER_BIN=/path/to/whisper-cli \
+PIPER_BIN=/path/to/piper \
+ESPEAK_DATA=/path/to/espeak-ng-data \
+MODELS_DIR=./models ./install_models.sh   # download models first
 ./voice-assistant
 ```
 
 ### Rebuild Container
 
 ```bash
-docker-compose build --no-cache
+docker compose build --no-cache
 ```
 
 ## Troubleshooting
@@ -267,27 +296,24 @@ docker-compose build --no-cache
 
 ```bash
 # Check ALSA devices
-docker-compose run --rm voice-assistant aplay -l
+docker compose run --rm voice-assistant aplay -l
 
-# Test microphone
-docker-compose run --rm voice-assistant arecord -D default -f cd test.wav
-
-# Check audio permissions
-usermod -aG audio $USER
+# Test microphone (5s recording)
+docker compose run --rm voice-assistant bash -c 'sox -d -r 16000 -c 1 -b 16 /tmp/test.wav trim 0 5'
 ```
 
 ### Model Issues
 
 ```bash
 # Re-download models
-docker-compose run --rm voice-assistant ./install_models.sh
+docker compose run --rm voice-assistant /app/install_models.sh
 ```
 
 ### LLM Connection
 
 ```bash
-# Check llama.cpp is running
-curl http://localhost:8080/completion
+# Check llama.cpp is running (host network mode)
+docker compose run --rm voice-assistant curl -s http://127.0.0.1:8080/health
 
 # Start llama.cpp
 docker run -p 8080:8080 \
@@ -300,16 +326,19 @@ docker run -p 8080:8080 \
 
 ```
 voice-assistant/
-├── AGENTS.md              # Project context and architecture
-├── docker-compose.yml     # Container orchestration
-├── Dockerfile             # Container build instructions
-├── orchestrator.go        # Go orchestrator code
-├── go.mod                 # Go module definition
-├── entrypoint.sh          # Container startup script
-├── install_models.sh      # Model download script
-├── start.sh               # Quick start script
-├── README.md              # User documentation
-└── .dockerignore          # Docker build ignore rules
+├── AGENTS.md                  # Project context and architecture
+├── docker-compose.yml         # Container orchestration
+├── Dockerfile                 # Container build instructions
+├── orchestrator.go            # Go orchestrator code
+├── go.mod                     # Go module definition
+├── entrypoint.sh              # Container startup script
+├── install_models.sh          # Model download script
+├── start.sh                   # Quick start script
+├── README.md                  # User documentation
+├── IMPLEMENTATION_SPEC.md     # This file
+├── PERFORMANCE_IMPROVEMENTS.md# Optimization plan
+├── LICENSES/                  # Third-party licenses
+└── .dockerignore              # Docker build ignore rules
 ```
 
 ## License

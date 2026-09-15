@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,18 +25,45 @@ type LLMResponse struct {
 }
 
 type Config struct {
-	WhisperModel string
-	PiperModel   string
-	LLMEndpoint  string
-	Debug        bool
+	WhisperBin     string
+	WhisperModel   string
+	PiperBin       string
+	PiperModel     string
+	EspeakData     string
+	LLMEndpoint    string
+	LLMTimeout     time.Duration
+	CaptureSeconds int
+	Debug          bool
+}
+
+func getenv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 func loadConfig() *Config {
+	llmTimeout, err := time.ParseDuration(getenv("LLM_TIMEOUT", "30s"))
+	if err != nil || llmTimeout <= 0 {
+		llmTimeout = 30 * time.Second
+	}
+
+	captureSeconds, err := strconv.Atoi(getenv("CAPTURE_SECONDS", "5"))
+	if err != nil || captureSeconds <= 0 {
+		captureSeconds = 5
+	}
+
 	return &Config{
-		WhisperModel: os.Getenv("WHISPER_MODEL"),
-		PiperModel:   os.Getenv("PIPER_MODEL"),
-		LLMEndpoint:  os.Getenv("LLM_ENDPOINT"),
-		Debug:        os.Getenv("DEBUG") == "true",
+		WhisperBin:     getenv("WHISPER_BIN", "/app/whisper-cli"),
+		WhisperModel:   getenv("WHISPER_MODEL", "/models/whisper/ggml-tiny.en.bin"),
+		PiperBin:       getenv("PIPER_BIN", "/app/piper"),
+		PiperModel:     getenv("PIPER_MODEL", "/models/piper/en_US-lessac-medium.onnx"),
+		EspeakData:     getenv("ESPEAK_DATA", "/opt/espeak-ng-data"),
+		LLMEndpoint:    strings.TrimRight(getenv("LLM_ENDPOINT", "http://127.0.0.1:8080"), "/"),
+		LLMTimeout:     llmTimeout,
+		CaptureSeconds: captureSeconds,
+		Debug:          os.Getenv("DEBUG") == "true",
 	}
 }
 
@@ -46,19 +74,19 @@ func debugLog(msg string) {
 }
 
 func captureAudio(config *Config) ([]byte, error) {
-	// Use sox to capture from ALSA device directly to 16kHz WAV
+	// Use sox to capture from the ALSA default device directly as 16kHz WAV
 	tmpFile := fmt.Sprintf("/tmp/%d.wav", time.Now().UnixNano())
 	defer os.Remove(tmpFile)
 
 	cmd := exec.Command(
 		"sox",
-		"-d",           // default audio device
-		"-r", "16000",  // 16kHz sample rate
-		"-c", "1",      // mono
-		"-b", "16",     // 16-bit
-		"-t", "wav",    // WAV format
-		tmpFile,        // output file
-		"trim", "0", "5", // trim: start at 0, duration 5 seconds
+		"-d",          // default audio device
+		"-r", "16000", // 16kHz sample rate
+		"-c", "1", // mono
+		"-b", "16", // 16-bit
+		"-t", "wav", // WAV format
+		tmpFile,                                          // output file
+		"trim", "0", strconv.Itoa(config.CaptureSeconds), // record a fixed window
 	)
 
 	output, err := cmd.CombinedOutput()
@@ -77,19 +105,26 @@ func captureAudio(config *Config) ([]byte, error) {
 }
 
 func sttWithWhisper(wavData []byte, config *Config) (string, error) {
-	tmpFile := fmt.Sprintf("/tmp/%d.wav", time.Now().UnixNano())
-	err := os.WriteFile(tmpFile, wavData, 0644)
+	// whisper-cli writes the transcript to <base>.txt when given
+	// `-of <base> -otxt`; we read that file instead of parsing the
+	// binary's log output (which contains banners, timings and colors).
+	tmpBase := fmt.Sprintf("/tmp/%d", time.Now().UnixNano())
+	wavFile := tmpBase + ".wav"
+	txtFile := tmpBase + ".txt"
+
+	err := os.WriteFile(wavFile, wavData, 0644)
 	if err != nil {
 		return "", fmt.Errorf("failed to write temp file: %w", err)
 	}
-	defer os.Remove(tmpFile)
+	defer os.Remove(wavFile)
+	defer os.Remove(txtFile)
 
 	cmd := exec.Command(
-		"/app/whisper-cli",
+		config.WhisperBin,
 		"-m", config.WhisperModel,
-		"-f", tmpFile,
+		"-f", wavFile,
+		"-of", tmpBase,
 		"-otxt",
-		"-pc",
 	)
 
 	output, err := cmd.CombinedOutput()
@@ -97,7 +132,12 @@ func sttWithWhisper(wavData []byte, config *Config) (string, error) {
 		return "", fmt.Errorf("whisper failed: %w, output: %s", err, string(output))
 	}
 
-	text := strings.TrimSpace(string(output))
+	raw, err := os.ReadFile(txtFile)
+	if err != nil {
+		return "", fmt.Errorf("failed to read transcript file: %w", err)
+	}
+
+	text := strings.TrimSpace(string(raw))
 	debugLog(fmt.Sprintf("STT result: %s", text))
 
 	return text, nil
@@ -115,7 +155,8 @@ func callLLM(prompt string, config *Config) (string, error) {
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	resp, err := http.Post(
+	client := &http.Client{Timeout: config.LLMTimeout}
+	resp, err := client.Post(
 		config.LLMEndpoint+"/completion",
 		"application/json",
 		bytes.NewBuffer(jsonData),
@@ -130,6 +171,10 @@ func callLLM(prompt string, config *Config) (string, error) {
 		return "", fmt.Errorf("failed to read LLM response: %w", err)
 	}
 
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("LLM returned status %d: %s", resp.StatusCode, string(body))
+	}
+
 	var llmResp LLMResponse
 	err = json.Unmarshal(body, &llmResp)
 	if err != nil {
@@ -142,15 +187,22 @@ func callLLM(prompt string, config *Config) (string, error) {
 }
 
 func ttsWithPiper(text string, config *Config) ([]byte, error) {
+	// piper reads the text to synthesize from stdin and writes a WAV
+	// file at the voice's native sample rate (no --input-text/--sample-rate
+	// options exist in the piper CLI).
 	tmpFile := fmt.Sprintf("/tmp/%d.wav", time.Now().UnixNano())
+	defer os.Remove(tmpFile)
 
-	cmd := exec.Command(
-		"/app/piper",
+	args := []string{
 		"--model", config.PiperModel,
-		"--input-text", text,
 		"--output-file", tmpFile,
-		"--sample-rate", "22050",
-	)
+	}
+	if config.EspeakData != "" {
+		args = append(args, "--espeak-data", config.EspeakData)
+	}
+
+	cmd := exec.Command(config.PiperBin, args...)
+	cmd.Stdin = strings.NewReader(text + "\n")
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -161,8 +213,6 @@ func ttsWithPiper(text string, config *Config) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read audio file: %w", err)
 	}
-
-	os.Remove(tmpFile)
 
 	debugLog(fmt.Sprintf("Generated %d bytes of audio", len(audioData)))
 
@@ -200,17 +250,19 @@ func main() {
 	fmt.Println()
 
 	for {
-		fmt.Print("Listening... ")
+		fmt.Printf("Listening... (%ds window)\n", config.CaptureSeconds)
+
+		// Measure end-to-end, including the capture window.
+		startTime := time.Now()
 
 		wavData, err := captureAudio(config)
 		if err != nil {
 			log.Printf("Failed to capture audio: %v", err)
 			continue
 		}
+		captureTime := time.Since(startTime)
 
 		fmt.Println("Processing...")
-
-		startTime := time.Now()
 
 		text, err := sttWithWhisper(wavData, config)
 		if err != nil {
@@ -220,7 +272,9 @@ func main() {
 
 		fmt.Printf("You said: %s\n", text)
 
-		if strings.TrimSpace(text) == "" {
+		// whisper.cpp writes "[BLANK_AUDIO]" when the capture window
+		// contains only silence.
+		if t := strings.TrimSpace(text); t == "" || t == "[BLANK_AUDIO]" {
 			fmt.Println("No speech detected. Listening again...")
 			continue
 		}
@@ -252,7 +306,10 @@ func main() {
 		}
 
 		totalTime := time.Since(startTime)
-		fmt.Printf("Total latency: %v\n", totalTime)
+		fmt.Printf("Capture: %v | STT+LLM+TTS+playback: %v | Total: %v\n",
+			captureTime.Round(time.Millisecond),
+			(totalTime - captureTime).Round(time.Millisecond),
+			totalTime.Round(time.Millisecond))
 		fmt.Println()
 
 		if config.Debug {

@@ -1,20 +1,19 @@
-version: '3.8'
-
 services:
   voice-assistant:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: voice-assistant
+    # Host networking gives direct access to the llama.cpp server on the
+    # host (http://127.0.0.1:8080) and to ALSA audio devices.
     network_mode: host
     volumes:
       - ./models:/models
       - /dev/snd:/dev/snd
-      - ./entrypoint.sh:/entrypoint.sh:ro
     environment:
       - WHISPER_MODEL=/models/whisper/ggml-tiny.en.bin
       - PIPER_MODEL=/models/piper/en_US-lessac-medium.onnx
-      - LLM_ENDPOINT=http://host.docker.internal:8080
+      - LLM_ENDPOINT=http://127.0.0.1:8080
       - DEBUG=false
     devices:
       - /dev/snd:/dev/snd
