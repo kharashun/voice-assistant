@@ -39,7 +39,7 @@ sox -d → 16kHz mono 16-bit WAV (fixed capture window, default 5s)
     ↓
 whisper-cli (STT) → transcript file (<base>.txt via -of/-otxt)
     ↓
-HTTP POST to llama.cpp 127.0.0.1:8080/completion
+HTTP POST to llama.cpp 127.0.0.1:8080/v1/chat/completions
     ↓
 Response text
     ↓
@@ -68,6 +68,8 @@ docker compose up -d
 | `WHISPER_MODEL` | `/models/whisper/ggml-tiny.en.bin` | Path to whisper model |
 | `PIPER_MODEL` | `/models/piper/en_US-lessac-medium.onnx` | Path to piper model |
 | `LLM_ENDPOINT` | `http://127.0.0.1:8080` | LLM API endpoint (host network mode); overridable via host env var or `.env` file |
+| `LLM_MODEL` | _(unset)_ | Model name sent in every request; required for llama.cpp router mode (`--models-dir`/`--model-presets`), ignored by single-model servers |
+| `LLM_SYSTEM_PROMPT` | `You are a voice assistant. Reply in one or two short sentences.` | System prompt for chat completions |
 | `LLM_TIMEOUT` | `30s` | LLM request timeout (Go duration) |
 | `CAPTURE_SECONDS` | `5` | Fixed audio capture window in seconds |
 | `WHISPER_BIN` | `/app/whisper-cli` | whisper-cli binary path |
@@ -157,8 +159,11 @@ voice-assistant/
 - Calls whisper-cli, reads the transcript from the `-of <base> -otxt` file
   (never parses the binary's log output)
 - Skips the LLM when whisper reports silence (`[BLANK_AUDIO]` or empty text)
-- POSTs to llama.cpp `/completion` with a configurable timeout and
-  status-code check
+- POSTs to llama.cpp `/v1/chat/completions` (system + user message) with a
+  configurable timeout and status-code check
+- Sends `LLM_MODEL` in the request body: required when the llama.cpp
+  server runs in router mode (`--models-dir`/`--model-presets`), which
+  rejects requests without a model name; single-model servers ignore it
 - Sends TTS text to piper via **stdin** (piper has no `--input-text` flag)
 - Plays audio via `aplay`
 - Measures and reports total latency including the capture window
@@ -188,9 +193,10 @@ voice-assistant/
 - Host network mode (`network_mode: host`) - the llama.cpp server on the
   host is reached via `http://127.0.0.1:8080` (`host.docker.internal` is NOT
   resolvable in host network mode on Linux)
-- `LLM_ENDPOINT` is passed through in docker-compose.yml as
-  `${LLM_ENDPOINT:-http://127.0.0.1:8080}`, so it can be overridden via a
-  host env var or a `.env` file (see `.env.example`)
+- `LLM_ENDPOINT`, `LLM_MODEL` and `LLM_SYSTEM_PROMPT` are passed through
+  in docker-compose.yml (e.g. `${LLM_ENDPOINT:-http://127.0.0.1:8080}`),
+  so they can be overridden via host env vars or a `.env` file (see
+  `.env.example`)
 - /dev/snd passthrough for ALSA audio
 - Volume mounts for models
 - Entrypoint passes through any command given via

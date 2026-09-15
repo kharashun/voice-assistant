@@ -14,26 +14,36 @@ import (
 	"time"
 )
 
-type LLMRequest struct {
-	Prompt      string  `json:"prompt"`
-	MaxTokens   int     `json:"max_tokens"`
-	Temperature float64 `json:"temperature"`
-}
-
-type LLMResponse struct {
+type ChatMessage struct {
+	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
+type LLMRequest struct {
+	Model       string        `json:"model,omitempty"`
+	Messages    []ChatMessage `json:"messages"`
+	MaxTokens   int           `json:"max_tokens"`
+	Temperature float64       `json:"temperature"`
+}
+
+type LLMResponse struct {
+	Choices []struct {
+		Message ChatMessage `json:"message"`
+	} `json:"choices"`
+}
+
 type Config struct {
-	WhisperBin     string
-	WhisperModel   string
-	PiperBin       string
-	PiperModel     string
-	EspeakData     string
-	LLMEndpoint    string
-	LLMTimeout     time.Duration
-	CaptureSeconds int
-	Debug          bool
+	WhisperBin      string
+	WhisperModel    string
+	PiperBin        string
+	PiperModel      string
+	EspeakData      string
+	LLMEndpoint     string
+	LLMModel        string
+	LLMSystemPrompt string
+	LLMTimeout      time.Duration
+	CaptureSeconds  int
+	Debug           bool
 }
 
 func getenv(key, def string) string {
@@ -55,15 +65,17 @@ func loadConfig() *Config {
 	}
 
 	return &Config{
-		WhisperBin:     getenv("WHISPER_BIN", "/app/whisper-cli"),
-		WhisperModel:   getenv("WHISPER_MODEL", "/models/whisper/ggml-tiny.en.bin"),
-		PiperBin:       getenv("PIPER_BIN", "/app/piper"),
-		PiperModel:     getenv("PIPER_MODEL", "/models/piper/en_US-lessac-medium.onnx"),
-		EspeakData:     getenv("ESPEAK_DATA", "/opt/espeak-ng-data"),
-		LLMEndpoint:    strings.TrimRight(getenv("LLM_ENDPOINT", "http://127.0.0.1:8080"), "/"),
-		LLMTimeout:     llmTimeout,
-		CaptureSeconds: captureSeconds,
-		Debug:          os.Getenv("DEBUG") == "true",
+		WhisperBin:      getenv("WHISPER_BIN", "/app/whisper-cli"),
+		WhisperModel:    getenv("WHISPER_MODEL", "/models/whisper/ggml-tiny.en.bin"),
+		PiperBin:        getenv("PIPER_BIN", "/app/piper"),
+		PiperModel:      getenv("PIPER_MODEL", "/models/piper/en_US-lessac-medium.onnx"),
+		EspeakData:      getenv("ESPEAK_DATA", "/opt/espeak-ng-data"),
+		LLMEndpoint:     strings.TrimRight(getenv("LLM_ENDPOINT", "http://127.0.0.1:8080"), "/"),
+		LLMModel:        getenv("LLM_MODEL", ""),
+		LLMSystemPrompt: getenv("LLM_SYSTEM_PROMPT", "You are a voice assistant. Reply in one or two short sentences."),
+		LLMTimeout:      llmTimeout,
+		CaptureSeconds:  captureSeconds,
+		Debug:           os.Getenv("DEBUG") == "true",
 	}
 }
 
@@ -144,8 +156,15 @@ func sttWithWhisper(wavData []byte, config *Config) (string, error) {
 }
 
 func callLLM(prompt string, config *Config) (string, error) {
+	messages := make([]ChatMessage, 0, 2)
+	if config.LLMSystemPrompt != "" {
+		messages = append(messages, ChatMessage{Role: "system", Content: config.LLMSystemPrompt})
+	}
+	messages = append(messages, ChatMessage{Role: "user", Content: prompt})
+
 	req := LLMRequest{
-		Prompt:      prompt,
+		Model:       config.LLMModel,
+		Messages:    messages,
 		MaxTokens:   100,
 		Temperature: 0.7,
 	}
@@ -157,7 +176,7 @@ func callLLM(prompt string, config *Config) (string, error) {
 
 	client := &http.Client{Timeout: config.LLMTimeout}
 	resp, err := client.Post(
-		config.LLMEndpoint+"/completion",
+		config.LLMEndpoint+"/v1/chat/completions",
 		"application/json",
 		bytes.NewBuffer(jsonData),
 	)
@@ -180,10 +199,14 @@ func callLLM(prompt string, config *Config) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to parse LLM response: %w, body: %s", err, string(body))
 	}
+	if len(llmResp.Choices) == 0 {
+		return "", fmt.Errorf("LLM response contains no choices, body: %s", string(body))
+	}
 
-	debugLog(fmt.Sprintf("LLM response: %s", llmResp.Content))
+	content := llmResp.Choices[0].Message.Content
+	debugLog(fmt.Sprintf("LLM response: %s", content))
 
-	return llmResp.Content, nil
+	return content, nil
 }
 
 func ttsWithPiper(text string, config *Config) ([]byte, error) {
@@ -245,6 +268,9 @@ func main() {
 	log.Printf("Whisper model: %s", config.WhisperModel)
 	log.Printf("Piper model: %s", config.PiperModel)
 	log.Printf("LLM endpoint: %s", config.LLMEndpoint)
+	if config.LLMModel != "" {
+		log.Printf("LLM model: %s", config.LLMModel)
+	}
 
 	fmt.Println("Voice Assistant ready! Press Ctrl+C to exit.")
 	fmt.Println()

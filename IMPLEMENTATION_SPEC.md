@@ -56,8 +56,8 @@ captureAudio() → sttWithWhisper() → callLLM() → ttsWithPiper() → playAud
 ```
 
 **API Integration:**
-- LLM endpoint: `http://127.0.0.1:8080/completion` (container runs in host
-  network mode; `host.docker.internal` is not resolvable there on Linux)
+- LLM endpoint: `http://127.0.0.1:8080/v1/chat/completions` (container runs in
+  host network mode; `host.docker.internal` is not resolvable there on Linux)
 - Piper: `/app/piper` (CLI mode; text is written to its stdin, output WAV is
   written via `--output-file`)
 
@@ -70,6 +70,8 @@ type Config struct {
     PiperModel     string        // PIPER_MODEL env var
     EspeakData     string        // ESPEAK_DATA env var
     LLMEndpoint    string        // LLM_ENDPOINT env var
+    LLMModel       string        // LLM_MODEL env var (required for llama.cpp router mode)
+    LLMSystemPrompt string       // LLM_SYSTEM_PROMPT env var
     LLMTimeout     time.Duration // LLM_TIMEOUT env var
     CaptureSeconds int           // CAPTURE_SECONDS env var
     Debug          bool          // DEBUG env var

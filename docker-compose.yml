@@ -15,6 +15,8 @@ services:
       - PIPER_MODEL=/models/piper/en_US-lessac-medium.onnx
       # Overridable via host env var or .env file (see .env.example)
       - LLM_ENDPOINT=${LLM_ENDPOINT:-http://127.0.0.1:8080}
+      - LLM_MODEL=${LLM_MODEL:-}
+      - LLM_SYSTEM_PROMPT=${LLM_SYSTEM_PROMPT:-}
       - DEBUG=false
     devices:
       - /dev/snd:/dev/snd

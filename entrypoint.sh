@@ -15,6 +15,7 @@ echo "Config:"
 echo "  WHISPER_MODEL: $WHISPER_MODEL"
 echo "  PIPER_MODEL: $PIPER_MODEL"
 echo "  LLM_ENDPOINT: $LLM_ENDPOINT"
+echo "  LLM_MODEL: ${LLM_MODEL:-(none)}"
 
 # If a command was passed (e.g. `docker compose run --rm voice-assistant <cmd>`
 # for /app/install_models.sh, aplay -l, debugging shells, ...), run it directly.

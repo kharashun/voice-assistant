@@ -61,6 +61,8 @@ Environment variables (all optional, see AGENTS.md for the full table):
 - `WHISPER_MODEL`: Path to whisper model (default: `/models/whisper/ggml-tiny.en.bin`)
 - `PIPER_MODEL`: Path to piper model (default: `/models/piper/en_US-lessac-medium.onnx`)
 - `LLM_ENDPOINT`: LLM API endpoint (default: `http://127.0.0.1:8080` - the container runs in host network mode)
+- `LLM_MODEL`: Model name sent with every request (required for llama.cpp router mode, e.g. `--models-dir`; default: empty)
+- `LLM_SYSTEM_PROMPT`: System prompt for chat completions (default: short voice-assistant prompt)
 - `LLM_TIMEOUT`: LLM request timeout (default: `30s`)
 - `CAPTURE_SECONDS`: Fixed capture window in seconds (default: `5`)
 - `DEBUG`: Enable debug logging (default: `false`)
@@ -142,6 +144,10 @@ points to):
 ```bash
 docker run -p 8080:8080 -v /path/to/model:/model ggerganov/llama.cpp:server -m /model/gguf
 ```
+
+If the server runs in router mode (`--models-dir`/`--model-presets`) you'll
+get `400: model name is missing from the request` — set `LLM_MODEL` in
+`.env` to one of the names from `/v1/models`.
 
 ## Licenses
 
