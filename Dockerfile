@@ -1,4 +1,4 @@
-FROM golang:1.23-bookworm AS builder
+FROM golang:1.23-bookworm@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -24,22 +24,28 @@ RUN pip install --no-cache-dir --break-system-packages "cmake>=3.26"
 # Clone and build whisper.cpp (CPU only, English models).
 # SDL2 and FFmpeg are disabled: input is a plain 16kHz WAV produced by sox,
 # so whisper-cli has no libav*/SDL runtime dependencies.
-RUN git clone --depth 1 --branch v1.9.4 https://github.com/ggml-org/whisper.cpp.git && \
-    cd whisper.cpp && \
+# Clone and build are separate layers (cmake flag changes don't re-download)
+# and the build tree is removed after copying the binary so the cached layer
+# diff stays small (BuildKit GC evicts large records when the disk is full).
+RUN git clone --depth 1 --branch v1.9.4 https://github.com/ggml-org/whisper.cpp.git
+RUN cd whisper.cpp && \
     cmake -B build -DWHISPER_SDL2=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_BUILD_TYPE=Release && \
     cmake --build build --config Release -j$(nproc) && \
-    cp build/bin/whisper-cli /workspace/
+    cp build/bin/whisper-cli /workspace/ && \
+    rm -rf /workspace/whisper.cpp
 
 # Clone and build piper (C++ CLI from libpiper, built from source).
 # espeak-ng is built as a static dependency and onnxruntime is fetched
 # as a prebuilt library by cmake. Text is read from stdin.
-RUN git clone --depth 1 --branch v1.8.0 https://github.com/OHF-Voice/piper1-gpl.git piper && \
-    cmake -S piper/libpiper -B piper/build -DCMAKE_BUILD_TYPE=Release && \
+# Same layering rationale as whisper above.
+RUN git clone --depth 1 --branch v1.8.0 https://github.com/OHF-Voice/piper1-gpl.git piper
+RUN cmake -S piper/libpiper -B piper/build -DCMAKE_BUILD_TYPE=Release && \
     cmake --build piper/build --config Release -j$(nproc) && \
     cp piper/build/src/main/piper_exe /workspace/piper_bin && \
     cp piper/build/libpiper.so /workspace/ && \
     cp piper/libpiper/lib/onnxruntime-linux-x64-*/lib/libonnxruntime.so /workspace/ && \
-    cp -r piper/build/espeak_ng-install/share/espeak-ng-data /workspace/espeak-ng-data
+    cp -r piper/build/espeak_ng-install/share/espeak-ng-data /workspace/espeak-ng-data && \
+    rm -rf /workspace/piper
 
 # Build orchestrator
 COPY go.mod /workspace/
@@ -47,7 +53,7 @@ COPY orchestrator.go /workspace/
 RUN go build -o voice-assistant orchestrator.go
 
 # Runtime stage
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 ENV DEBIAN_FRONTEND=noninteractive
 

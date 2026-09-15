@@ -111,8 +111,13 @@ ESPEAK_DATA=/path/to/espeak-ng-data ./voice-assistant
 ### Rebuild Docker
 
 ```bash
-docker compose build --no-cache
+docker compose build
 ```
+
+Rebuilds use the build cache — unchanged steps (including the git
+clones) are skipped, so a rebuild with no Dockerfile changes takes under
+a second. To force a full rebuild that re-downloads everything (e.g.
+when the cache is corrupt), use `docker compose build --no-cache`.
 
 ## Troubleshooting
 

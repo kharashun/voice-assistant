@@ -90,8 +90,8 @@ docker compose down
 # View logs
 docker compose logs -f
 
-# Rebuild
-docker compose build --no-cache
+# Rebuild (uses layer cache; add --no-cache only for a full reset)
+docker compose build
 
 # Run a command inside the container (entrypoint passes it through)
 docker compose run --rm voice-assistant aplay -l
@@ -180,6 +180,11 @@ voice-assistant/
 
 ### Docker Configuration
 - Single container approach
+- Base images pinned by digest (`golang:1.23-bookworm@sha256:...`,
+  `debian:bookworm-slim@sha256:...`) for reproducible builds
+- git clone and cmake build are separate RUN layers with build trees
+  removed after artifact copy — cached layer diffs stay small, and cmake
+  flag changes don't re-download sources
 - Host network mode (`network_mode: host`) - the llama.cpp server on the
   host is reached via `http://127.0.0.1:8080` (`host.docker.internal` is NOT
   resolvable in host network mode on Linux)
@@ -242,8 +247,34 @@ MODELS_DIR=./models ./install_models.sh   # download models first
 
 ### Rebuild Container
 ```bash
-docker compose build --no-cache
+docker compose build
 ```
+
+Builds go through the dedicated `voice` buildx builder (docker-container
+driver, selected as default). Its cache lives inside the builder container
+and survives rebuilds reliably; the daemon's embedded builder had broken
+cache persistence after a docker restart (records were never written, so
+every rebuild re-downloaded the sources from GitHub). If the builder is
+missing (e.g. after `docker buildx rm voice` or a fresh host), recreate it:
+
+```bash
+docker buildx create --name voice --driver docker-container --use
+```
+
+Unchanged steps (including the git clones) are skipped, so a rebuild with
+no Dockerfile changes takes under a second. `--no-cache` forces a full
+rebuild including re-downloading sources — use it only to reset a corrupt
+cache.
+
+### Build Cache Issues
+If rebuilds unexpectedly re-download the sources from GitHub every time,
+first check `docker buildx ls` — builds must use the `voice` builder, not
+the daemon's embedded `default` (see Rebuild Container above). Also check
+disk usage (`df -h /`): BuildKit's garbage collector evicts build-cache
+records when the disk is close to full (~80%+), so no layer cache survives
+between builds. The Dockerfile also keeps cached layer diffs small by
+cloning and building in separate layers and removing build trees after
+copying artifacts.
 
 ## License
 
