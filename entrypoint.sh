@@ -4,8 +4,8 @@ set -e
 
 echo "=== Voice Assistant Startup ==="
 
-export WHISPER_MODEL="${WHISPER_MODEL:-/models/whisper/ggml-tiny.en.bin}"
-export PIPER_MODEL="${PIPER_MODEL:-/models/piper/en_US-lessac-medium.onnx}"
+export WHISPER_MODEL="${WHISPER_MODEL:-/models/whisper/ggml-small.en-q5_1.bin}"
+export PIPER_MODEL="${PIPER_MODEL:-/models/piper/en_US-ryan-high.onnx}"
 # The container runs with network_mode: host, so the llama.cpp server on the
 # host is reachable via the loopback interface (host.docker.internal is only
 # resolvable on Docker's bridge networks, not in host mode on Linux).

@@ -7,7 +7,7 @@ This is a **low-latency voice assistant** system for Ubuntu that provides:
 - **LLM Processing**: Calls local llama.cpp API endpoint
 - **Text-to-Speech (TTS)**: piper (C++ CLI, built from source)
 
-**Processing latency target (after the fixed capture window): 2-3 seconds.**
+**Processing latency target (after the fixed capture window): 3-4 seconds.**
 
 ## Architecture
 
@@ -65,8 +65,9 @@ docker compose up -d
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WHISPER_MODEL` | `/models/whisper/ggml-tiny.en.bin` | Path to whisper model |
-| `PIPER_MODEL` | `/models/piper/en_US-lessac-medium.onnx` | Path to piper model |
+| `WHISPER_MODEL` | `/models/whisper/ggml-small.en-q5_1.bin` | Path to whisper model |
+| `WHISPER_THREADS` | _(unset)_ | CPU threads for whisper-cli (`-t`); unset = whisper-cli default (4); overridable via host env var or `.env` file |
+| `PIPER_MODEL` | `/models/piper/en_US-ryan-high.onnx` | Path to piper model |
 | `LLM_ENDPOINT` | `http://127.0.0.1:8080` | LLM API endpoint (host network mode); overridable via host env var or `.env` file |
 | `LLM_MODEL` | _(unset)_ | Model name sent in every request; required for llama.cpp router mode (`--models-dir`/`--model-presets`), ignored by single-model servers |
 | `LLM_SYSTEM_PROMPT` | `You are a voice assistant. Reply in one or two short sentences.` | System prompt for chat completions |
@@ -103,10 +104,10 @@ docker compose run --rm voice-assistant aplay -l
 
 | Component | Target Latency | Notes |
 |-----------|----------------|-------|
-| **Total (end-to-end)** | capture window + 2-3s | Includes the fixed 5s capture window |
-| Whisper STT | <500ms | tiny.en model, Release build |
+| **Total (end-to-end)** | capture window + 3-4s | Includes the fixed 5s capture window |
+| Whisper STT | <1500ms | small.en-q5_1 model, Release build (4 threads by default; raise `WHISPER_THREADS` to cut this) |
 | LLM inference | <1500ms | via llama.cpp |
-| Piper TTS | <500ms | CLI mode, model loaded per call |
+| Piper TTS | <1000ms | ryan-high model, CLI mode, model loaded per call |
 | Audio capture | fixed 5s window | `CAPTURE_SECONDS`, no VAD yet |
 
 The orchestrator measures latency from the start of capture and reports
@@ -116,8 +117,8 @@ capture time and processing time separately.
 
 | Model | Size | Description |
 |-------|------|-------------|
-| whisper tiny.en | 75MB | Fastest English STT model |
-| piper en_US-lessac-medium | 63MB | High-quality English TTS (+ .onnx.json config) |
+| whisper small.en-q5_1 | 190MB | Quantized English STT model; far better accuracy than tiny.en |
+| piper en_US-ryan-high | 120MB | Highest-quality male English TTS voice (+ .onnx.json config) |
 
 Models are downloaded from HuggingFace by `install_models.sh` into the
 `/models` volume (`./models` on the host).
@@ -146,7 +147,7 @@ voice-assistant/
 ├── PERFORMANCE_IMPROVEMENTS.md# Optimization plan
 ├── LICENSES/                  # Third-party licenses
 ├── .dockerignore              # Docker ignore file
-├── .env.example               # Template for .env overrides (LLM_ENDPOINT)
+├── .env.example               # Template for .env overrides (LLM_ENDPOINT, WHISPER_THREADS)
 └── models/                    # Mount point for models (host ./models)
     ├── whisper/
     └── piper/
@@ -158,6 +159,8 @@ voice-assistant/
 - Captures audio via `sox -d` directly as 16kHz mono WAV (single process)
 - Calls whisper-cli, reads the transcript from the `-of <base> -otxt` file
   (never parses the binary's log output)
+- Passes `-t $WHISPER_THREADS` to whisper-cli when `WHISPER_THREADS` is set
+  (whisper-cli otherwise defaults to 4 threads)
 - Skips the LLM when whisper reports silence (`[BLANK_AUDIO]` or empty text)
 - POSTs to llama.cpp `/v1/chat/completions` (system + user message) with a
   configurable timeout and status-code check
@@ -172,7 +175,8 @@ voice-assistant/
 - Built from source (ggml-org/whisper.cpp, pinned v1.9.4)
 - CPU only, no SDL2, no FFmpeg (input is plain WAV), statically linked
   (`BUILD_SHARED_LIBS=OFF`) - single self-contained binary
-- tiny.en model for fastest inference, Release build
+- small.en-q5_1 model (quantized) for far better accuracy at moderate
+  inference speed, Release build
 
 ### Piper Integration
 - Built from source (OHF-Voice/piper1-gpl, pinned v1.8.0): the C++ CLI
@@ -245,8 +249,8 @@ go build -o voice-assistant orchestrator.go
 WHISPER_BIN=/path/to/whisper-cli \
 PIPER_BIN=/path/to/piper \
 ESPEAK_DATA=/path/to/espeak-ng-data \
-WHISPER_MODEL=./models/whisper/ggml-tiny.en.bin \
-PIPER_MODEL=./models/piper/en_US-lessac-medium.onnx \
+WHISPER_MODEL=./models/whisper/ggml-small.en-q5_1.bin \
+PIPER_MODEL=./models/piper/en_US-ryan-high.onnx \
 MODELS_DIR=./models ./install_models.sh   # download models first
 ./voice-assistant
 ```

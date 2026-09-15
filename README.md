@@ -4,10 +4,10 @@ A low-latency voice assistant with speech-to-text (STT), LLM processing, and tex
 
 ## Features
 
-- **Speech-to-Text**: whisper.cpp (CPU, tiny.en model)
+- **Speech-to-Text**: whisper.cpp (CPU, small.en-q5_1 model)
 - **LLM Processing**: Calls local llama.cpp API
 - **Text-to-Speech**: piper (C++ CLI, built from source)
-- **Total Latency**: fixed capture window (default 5s) + 2-3s processing (target)
+- **Total Latency**: fixed capture window (default 5s) + 3-4s processing (target)
 - **SoX**: Single command for 16kHz WAV capture
 
 ## Architecture
@@ -58,8 +58,9 @@ docker compose down
 
 Environment variables (all optional, see AGENTS.md for the full table):
 
-- `WHISPER_MODEL`: Path to whisper model (default: `/models/whisper/ggml-tiny.en.bin`)
-- `PIPER_MODEL`: Path to piper model (default: `/models/piper/en_US-lessac-medium.onnx`)
+- `WHISPER_MODEL`: Path to whisper model (default: `/models/whisper/ggml-small.en-q5_1.bin`)
+- `WHISPER_THREADS`: CPU threads for whisper-cli's `-t` flag (default: unset = whisper-cli's default of 4)
+- `PIPER_MODEL`: Path to piper model (default: `/models/piper/en_US-ryan-high.onnx`)
 - `LLM_ENDPOINT`: LLM API endpoint (default: `http://127.0.0.1:8080` - the container runs in host network mode)
 - `LLM_MODEL`: Model name sent with every request (required for llama.cpp router mode, e.g. `--models-dir`; default: empty)
 - `LLM_SYSTEM_PROMPT`: System prompt for chat completions (default: short voice-assistant prompt)
@@ -89,15 +90,15 @@ docker compose up
 
 | Model | Size | Description |
 |-------|------|-------------|
-| whisper tiny.en | 75MB | Fastest English STT model |
-| piper en_US-lessac-medium | 63MB | High-quality English TTS (+ .onnx.json config) |
+| whisper small.en-q5_1 | 190MB | Quantized English STT model (far better accuracy than tiny.en) |
+| piper en_US-ryan-high | 120MB | Highest-quality male English TTS voice (+ .onnx.json config) |
 
 ## Performance Targets
 
-- **Total latency**: fixed 5s capture window + 2-3s processing
-- **Whisper STT**: <500ms
+- **Total latency**: fixed 5s capture window + 3-4s processing
+- **Whisper STT**: <1500ms (4 threads by default; raise `WHISPER_THREADS` to cut this)
 - **LLM inference**: <1500ms (via llama.cpp)
-- **Piper TTS**: <500ms
+- **Piper TTS**: <1000ms
 
 ## Development
 

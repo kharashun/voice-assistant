@@ -83,14 +83,15 @@ type Config struct {
 **Source:** ggml-org/whisper.cpp (pinned v1.9.4)
 **Build:** Compiled from source, statically linked (`BUILD_SHARED_LIBS=OFF`),
 no SDL2, no FFmpeg (input is a plain 16kHz WAV produced by sox)
-**Model:** ggml-tiny.en.bin (75MB)
+**Model:** ggml-small.en-q5_1.bin (190MB, quantized)
 **Mode:** CLI mode for lowest overhead
 **CPU Only:** No GPU acceleration
 
 **Command:**
 ```bash
-./whisper-cli -m /models/whisper/ggml-tiny.en.bin -f /tmp/input.wav \
+./whisper-cli -m /models/whisper/ggml-small.en-q5_1.bin -f /tmp/input.wav \
     -of /tmp/input -otxt
+# optional: -t $WHISPER_THREADS to use more than the default 4 CPU threads
 # transcript is then read from /tmp/input.txt
 ```
 
@@ -100,13 +101,13 @@ no SDL2, no FFmpeg (input is a plain 16kHz WAV produced by sox)
 **Build:** The C++ CLI (`libpiper/src/main/piper_exe`) built from source with
 cmake; espeak-ng is built as a static dependency, onnxruntime is fetched as a
 prebuilt shared library
-**Model:** en_US-lessac-medium.onnx (63MB) + .onnx.json config
+**Model:** en_US-ryan-high.onnx (120MB) + .onnx.json config
 **Mode:** CLI mode only (no HTTP server)
 
 **Command:**
 ```bash
 echo "Hello world" | /app/piper \
-    --model /models/piper/en_US-lessac-medium.onnx \
+    --model /models/piper/en_US-ryan-high.onnx \
     --espeak-data /opt/espeak-ng-data \
     --output-file /tmp/output.wav
 ```
@@ -130,8 +131,9 @@ services:
       - ./models:/models          # Model mount
       - /dev/snd:/dev/snd         # Audio device passthrough
     environment:
-      - WHISPER_MODEL=/models/whisper/ggml-tiny.en.bin
-      - PIPER_MODEL=/models/piper/en_US-lessac-medium.onnx
+      - WHISPER_MODEL=/models/whisper/ggml-small.en-q5_1.bin
+      - PIPER_MODEL=/models/piper/en_US-ryan-high.onnx
+      - WHISPER_THREADS=${WHISPER_THREADS:-}
       - LLM_ENDPOINT=http://127.0.0.1:8080
       - DEBUG=false
     devices:
@@ -178,17 +180,17 @@ aplay -q /tmp/output.wav
 | Component | Target | Actual (estimated) | Notes |
 |-----------|--------|-------------------|-------|
 | Audio capture | fixed 5s window | 5s | `CAPTURE_SECONDS`, no VAD |
-| Whisper STT | <500ms | 300-600ms | tiny.en model, Release build |
+| Whisper STT | <1500ms | 700-1500ms | small.en-q5_1 model, Release build |
 | LLM inference | <1500ms | 1-2s | depends on model/hardware |
-| Piper TTS | <500ms | 200-400ms | CLI mode, model loaded per call |
+| Piper TTS | <1000ms | 600-900ms | ryan-high model, CLI mode, model loaded per call |
 | Playback | <200ms | 100-200ms | aplay |
 | **Total** | 5s + <3s | 6.5-8s | includes the fixed capture window |
 
 ## Model Download (`install_models.sh`)
 
 Downloads models at runtime into the `/models` volume (mounted from `./models`):
-- Whisper: `ggml-tiny.en.bin` (75MB) from HuggingFace (ggerganov/whisper.cpp)
-- Piper: `en_US-lessac-medium.onnx` (63MB) + `.onnx.json` (5KB) from
+- Whisper: `ggml-small.en-q5_1.bin` (190MB) from HuggingFace (ggerganov/whisper.cpp)
+- Piper: `en_US-ryan-high.onnx` (120MB) + `.onnx.json` (4KB) from
   HuggingFace (rhasspy/piper-voices)
 
 ```bash
@@ -201,8 +203,9 @@ docker compose run --rm voice-assistant /app/install_models.sh
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WHISPER_MODEL` | `/models/whisper/ggml-tiny.en.bin` | Whisper model path |
-| `PIPER_MODEL` | `/models/piper/en_US-lessac-medium.onnx` | Piper model path |
+| `WHISPER_MODEL` | `/models/whisper/ggml-small.en-q5_1.bin` | Whisper model path |
+| `WHISPER_THREADS` | _(unset)_ | CPU threads for whisper-cli (`-t`); unset = whisper-cli default (4) |
+| `PIPER_MODEL` | `/models/piper/en_US-ryan-high.onnx` | Piper model path |
 | `LLM_ENDPOINT` | `http://127.0.0.1:8080` | LLM API URL |
 | `LLM_TIMEOUT` | `30s` | LLM request timeout (Go duration) |
 | `CAPTURE_SECONDS` | `5` | Fixed capture window |

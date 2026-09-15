@@ -35,6 +35,7 @@ type LLMResponse struct {
 type Config struct {
 	WhisperBin      string
 	WhisperModel    string
+	WhisperThreads  int
 	PiperBin        string
 	PiperModel      string
 	EspeakData      string
@@ -64,11 +65,18 @@ func loadConfig() *Config {
 		captureSeconds = 5
 	}
 
+	// 0 means unset: whisper-cli then uses its own default of 4 threads.
+	whisperThreads, err := strconv.Atoi(getenv("WHISPER_THREADS", "0"))
+	if err != nil || whisperThreads < 0 {
+		whisperThreads = 0
+	}
+
 	return &Config{
 		WhisperBin:      getenv("WHISPER_BIN", "/app/whisper-cli"),
-		WhisperModel:    getenv("WHISPER_MODEL", "/models/whisper/ggml-tiny.en.bin"),
+		WhisperModel:    getenv("WHISPER_MODEL", "/models/whisper/ggml-small.en-q5_1.bin"),
+		WhisperThreads:  whisperThreads,
 		PiperBin:        getenv("PIPER_BIN", "/app/piper"),
-		PiperModel:      getenv("PIPER_MODEL", "/models/piper/en_US-lessac-medium.onnx"),
+		PiperModel:      getenv("PIPER_MODEL", "/models/piper/en_US-ryan-high.onnx"),
 		EspeakData:      getenv("ESPEAK_DATA", "/opt/espeak-ng-data"),
 		LLMEndpoint:     strings.TrimRight(getenv("LLM_ENDPOINT", "http://127.0.0.1:8080"), "/"),
 		LLMModel:        getenv("LLM_MODEL", ""),
@@ -138,6 +146,9 @@ func sttWithWhisper(wavData []byte, config *Config) (string, error) {
 		"-of", tmpBase,
 		"-otxt",
 	)
+	if config.WhisperThreads > 0 {
+		cmd.Args = append(cmd.Args, "-t", strconv.Itoa(config.WhisperThreads))
+	}
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -266,6 +277,9 @@ func main() {
 
 	log.Println("Voice Assistant starting...")
 	log.Printf("Whisper model: %s", config.WhisperModel)
+	if config.WhisperThreads > 0 {
+		log.Printf("Whisper threads: %d", config.WhisperThreads)
+	}
 	log.Printf("Piper model: %s", config.PiperModel)
 	log.Printf("LLM endpoint: %s", config.LLMEndpoint)
 	if config.LLMModel != "" {

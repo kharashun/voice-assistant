@@ -11,9 +11,10 @@ services:
       - ./models:/models
       - /dev/snd:/dev/snd
     environment:
-      - WHISPER_MODEL=/models/whisper/ggml-tiny.en.bin
-      - PIPER_MODEL=/models/piper/en_US-lessac-medium.onnx
+      - WHISPER_MODEL=/models/whisper/ggml-small.en-q5_1.bin
+      - PIPER_MODEL=/models/piper/en_US-ryan-high.onnx
       # Overridable via host env var or .env file (see .env.example)
+      - WHISPER_THREADS=${WHISPER_THREADS:-}
       - LLM_ENDPOINT=${LLM_ENDPOINT:-http://127.0.0.1:8080}
       - LLM_MODEL=${LLM_MODEL:-}
       - LLM_SYSTEM_PROMPT=${LLM_SYSTEM_PROMPT:-}
