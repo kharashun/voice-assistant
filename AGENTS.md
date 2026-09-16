@@ -39,7 +39,7 @@ sox -d → 16kHz mono 16-bit WAV (fixed capture window, default 5s)
     ↓
 whisper-cli (STT) → transcript file (<base>.txt via -of/-otxt)
     ↓
-HTTP POST to llama.cpp 127.0.0.1:8080/v1/chat/completions
+HTTP POST to llama.cpp host.docker.internal:8080/v1/chat/completions
     ↓
 Response text
     ↓
@@ -54,8 +54,9 @@ aplay → Host Speaker
 # Build the Docker image
 docker compose build
 
-# Download models (first time only)
-docker compose run --rm voice-assistant /app/install_models.sh
+# Download models (first time only; --user 0 because the script writes to
+# the ./models volume and the container otherwise runs non-root)
+docker compose run --rm --user 0 voice-assistant /app/install_models.sh
 
 # Start the service
 docker compose up -d
@@ -68,7 +69,7 @@ docker compose up -d
 | `WHISPER_MODEL` | `/models/whisper/ggml-small.en-q5_1.bin` | Path to whisper model |
 | `WHISPER_THREADS` | _(unset)_ | CPU threads for whisper-cli (`-t`); unset = whisper-cli default (4); overridable via host env var or `.env` file |
 | `PIPER_MODEL` | `/models/piper/en_US-ryan-high.onnx` | Path to piper model |
-| `LLM_ENDPOINT` | `http://127.0.0.1:8080` | LLM API endpoint (host network mode); overridable via host env var or `.env` file |
+| `LLM_ENDPOINT` | `http://host.docker.internal:8080` | LLM API endpoint (bridge network, host-gateway alias); overridable via host env var or `.env` file |
 | `LLM_MODEL` | _(unset)_ | Model name sent in every request; required for llama.cpp router mode (`--models-dir`/`--model-presets`), ignored by single-model servers |
 | `LLM_SYSTEM_PROMPT` | `You are a voice assistant. Reply in one or two short sentences.` | System prompt for chat completions |
 | `LLM_TIMEOUT` | `30s` | LLM request timeout (Go duration) |
@@ -77,6 +78,7 @@ docker compose up -d
 | `PIPER_BIN` | `/app/piper` | piper binary path |
 | `ESPEAK_DATA` | `/opt/espeak-ng-data` | espeak-ng data dir for piper |
 | `DEBUG` | `false` | Enable debug logging |
+| `AUDIO_GID` | `29` | Host audio group GID, added via compose `group_add` so the non-root container user can open `/dev/snd` |
 
 ## Run Commands
 
@@ -128,7 +130,8 @@ Models are downloaded from HuggingFace by `install_models.sh` into the
 - Docker and Docker Compose (v2 plugin or v1 binary)
 - Ubuntu 22.04/24.04 host
 - Host with microphone and speaker
-- llama.cpp server running on `localhost:8080`
+- llama.cpp server running on port 8080, listening on the Docker bridge
+  gateway (e.g. `--host 0.0.0.0`), not only loopback
 
 ## Directory Structure
 
@@ -147,7 +150,7 @@ voice-assistant/
 ├── PERFORMANCE_IMPROVEMENTS.md# Optimization plan
 ├── LICENSES/                  # Third-party licenses
 ├── .dockerignore              # Docker ignore file
-├── .env.example               # Template for .env overrides (LLM_ENDPOINT, WHISPER_THREADS)
+├── .env.example               # Template for .env overrides (LLM_ENDPOINT, WHISPER_THREADS, AUDIO_GID)
 └── models/                    # Mount point for models (host ./models)
     ├── whisper/
     └── piper/
@@ -194,11 +197,17 @@ voice-assistant/
 - git clone and cmake build are separate RUN layers with build trees
   removed after artifact copy — cached layer diffs stay small, and cmake
   flag changes don't re-download sources
-- Host network mode (`network_mode: host`) - the llama.cpp server on the
-  host is reached via `http://127.0.0.1:8080` (`host.docker.internal` is NOT
-  resolvable in host network mode on Linux)
+- Bridge networking with the host-gateway alias
+  (`extra_hosts: host.docker.internal:host-gateway`) - the llama.cpp server
+  on the host is reached via `http://host.docker.internal:8080` and must
+  listen on the Docker bridge gateway (e.g. `--host 0.0.0.0`), not only
+  loopback
+- The runtime container runs as a non-root user (uid 1000, matches the
+  typical host user so the `./models` bind mount stays readable); the host
+  audio group is added via `group_add: ${AUDIO_GID:-29}` for `/dev/snd`
+  access, and model installs use `--user 0` (see Build Instructions)
 - `LLM_ENDPOINT`, `LLM_MODEL` and `LLM_SYSTEM_PROMPT` are passed through
-  in docker-compose.yml (e.g. `${LLM_ENDPOINT:-http://127.0.0.1:8080}`),
+  in docker-compose.yml (e.g. `${LLM_ENDPOINT:-http://host.docker.internal:8080}`),
   so they can be overridden via host env vars or a `.env` file (see
   `.env.example`)
 - /dev/snd passthrough for ALSA audio
@@ -220,15 +229,17 @@ docker compose run --rm voice-assistant bash -c 'sox -d -r 16000 -c 1 -b 16 /tmp
 ### Model Issues
 ```bash
 # Re-download models
-docker compose run --rm voice-assistant /app/install_models.sh
+docker compose run --rm --user 0 voice-assistant /app/install_models.sh
 ```
 
 ### LLM Connection
 ```bash
-# Ensure llama.cpp is running (from inside the container, host network mode)
-docker compose run --rm voice-assistant curl -s http://127.0.0.1:8080/health
+# Ensure llama.cpp is running and reachable (from inside the container,
+# via the host-gateway alias)
+docker compose run --rm voice-assistant curl -s http://host.docker.internal:8080/health
 
-# Start llama.cpp on the host
+# Start llama.cpp on the host (-p 8080:8080 publishes on all interfaces,
+# which the bridge-network container can reach via host.docker.internal)
 docker run -p 8080:8080 ggerganov/llama.cpp:server -m /model.gguf
 ```
 

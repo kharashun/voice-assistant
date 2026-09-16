@@ -17,13 +17,13 @@ A low-latency voice assistant system for Ubuntu with speech-to-text (STT), LLM p
 │         │                   │                   │           │
 │         ▼                   ▼                   ▼           │
 │  ┌─────────────────────────────────────────────────────┐   │
-│  │        Docker Container (Combined, host network)    │   │
+│  │        Docker Container (Combined, bridge mode)     │   │
 │  │                                                     │   │
 │  │  ┌─────────────────────────────────────────────┐   │   │
 │  │  │  voice-assistant (Go Orchestrator)          │   │   │
 │  │  │  - Audio capture (sox, single process)      │   │   │
 │  │  │  - Whisper STT integration                  │   │   │
-│  │  │  - LLM API calls (127.0.0.1:8080)           │   │   │
+│  │  │  - LLM API calls (host.docker.internal:8080)│   │   │
 │  │  │  - Piper TTS integration (text via stdin)   │   │   │
 │  │  │  - Audio playback (aplay)                   │   │   │
 │  │  └─────────────────────────────────────────────┘   │   │
@@ -56,8 +56,10 @@ captureAudio() → sttWithWhisper() → callLLM() → ttsWithPiper() → playAud
 ```
 
 **API Integration:**
-- LLM endpoint: `http://127.0.0.1:8080/v1/chat/completions` (container runs in
-  host network mode; `host.docker.internal` is not resolvable there on Linux)
+- LLM endpoint: `http://host.docker.internal:8080/v1/chat/completions`
+  (bridge network with the host-gateway alias; the llama.cpp server on the
+  host must listen on the Docker bridge gateway, e.g. `--host 0.0.0.0`,
+  not only on loopback)
 - Piper: `/app/piper` (CLI mode; text is written to its stdin, output WAV is
   written via `--output-file`)
 
@@ -126,20 +128,20 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: voice-assistant
-    network_mode: host  # Access host llama.cpp API via 127.0.0.1:8080
+    extra_hosts:                  # Reach host llama.cpp via host-gateway alias
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./models:/models          # Model mount
-      - /dev/snd:/dev/snd         # Audio device passthrough
     environment:
       - WHISPER_MODEL=/models/whisper/ggml-small.en-q5_1.bin
       - PIPER_MODEL=/models/piper/en_US-ryan-high.onnx
       - WHISPER_THREADS=${WHISPER_THREADS:-}
-      - LLM_ENDPOINT=http://127.0.0.1:8080
+      - LLM_ENDPOINT=http://host.docker.internal:8080
       - DEBUG=false
     devices:
-      - /dev/snd:/dev/snd
-    cap_add:
-      - SYS_NICE
+      - /dev/snd:/dev/snd         # Audio device passthrough
+    group_add:                    # Host audio group for non-root /dev/snd access
+      - "${AUDIO_GID:-29}"
     restart: unless-stopped
 ```
 
@@ -206,7 +208,7 @@ docker compose run --rm voice-assistant /app/install_models.sh
 | `WHISPER_MODEL` | `/models/whisper/ggml-small.en-q5_1.bin` | Whisper model path |
 | `WHISPER_THREADS` | _(unset)_ | CPU threads for whisper-cli (`-t`); unset = whisper-cli default (4) |
 | `PIPER_MODEL` | `/models/piper/en_US-ryan-high.onnx` | Piper model path |
-| `LLM_ENDPOINT` | `http://127.0.0.1:8080` | LLM API URL |
+| `LLM_ENDPOINT` | `http://host.docker.internal:8080` | LLM API URL (bridge network, host-gateway alias) |
 | `LLM_TIMEOUT` | `30s` | LLM request timeout (Go duration) |
 | `CAPTURE_SECONDS` | `5` | Fixed capture window |
 | `WHISPER_BIN` | `/app/whisper-cli` | whisper-cli binary path |
@@ -311,14 +313,14 @@ docker compose run --rm voice-assistant bash -c 'sox -d -r 16000 -c 1 -b 16 /tmp
 
 ```bash
 # Re-download models
-docker compose run --rm voice-assistant /app/install_models.sh
+docker compose run --rm --user 0 voice-assistant /app/install_models.sh
 ```
 
 ### LLM Connection
 
 ```bash
-# Check llama.cpp is running (host network mode)
-docker compose run --rm voice-assistant curl -s http://127.0.0.1:8080/health
+# Check llama.cpp is running (via the host-gateway alias)
+docker compose run --rm voice-assistant curl -s http://host.docker.internal:8080/health
 
 # Start llama.cpp
 docker run -p 8080:8080 \

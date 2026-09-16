@@ -61,12 +61,13 @@ Environment variables (all optional, see AGENTS.md for the full table):
 - `WHISPER_MODEL`: Path to whisper model (default: `/models/whisper/ggml-small.en-q5_1.bin`)
 - `WHISPER_THREADS`: CPU threads for whisper-cli's `-t` flag (default: unset = whisper-cli's default of 4)
 - `PIPER_MODEL`: Path to piper model (default: `/models/piper/en_US-ryan-high.onnx`)
-- `LLM_ENDPOINT`: LLM API endpoint (default: `http://127.0.0.1:8080` - the container runs in host network mode)
+- `LLM_ENDPOINT`: LLM API endpoint (default: `http://host.docker.internal:8080` - bridge network with host-gateway alias; the host server must listen on the bridge gateway, e.g. `--host 0.0.0.0`)
 - `LLM_MODEL`: Model name sent with every request (required for llama.cpp router mode, e.g. `--models-dir`; default: empty)
 - `LLM_SYSTEM_PROMPT`: System prompt for chat completions (default: short voice-assistant prompt)
 - `LLM_TIMEOUT`: LLM request timeout (default: `30s`)
 - `CAPTURE_SECONDS`: Fixed capture window in seconds (default: `5`)
 - `DEBUG`: Enable debug logging (default: `false`)
+- `AUDIO_GID`: Host audio group GID for `/dev/snd` access as the non-root container user (default: `29`)
 
 ### Changing the LLM endpoint
 
@@ -133,14 +134,15 @@ docker compose run --rm voice-assistant aplay -l
 
 ### Model not found
 
-Run the install script:
+Run the install script (as root, since it writes to the `./models` volume):
 ```bash
-docker compose run --rm voice-assistant /app/install_models.sh
+docker compose run --rm --user 0 voice-assistant /app/install_models.sh
 ```
 ### LLM connection failed
 
-Ensure llama.cpp is running on `localhost:8080` (or whatever `LLM_ENDPOINT`
-points to):
+Ensure llama.cpp is running on port 8080 and listening on all interfaces
+(`--host 0.0.0.0`) so the bridge-network container can reach it — or
+whatever `LLM_ENDPOINT` points to:
 
 ```bash
 docker run -p 8080:8080 -v /path/to/model:/model ggerganov/llama.cpp:server -m /model/gguf

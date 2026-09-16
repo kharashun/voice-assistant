@@ -4,23 +4,27 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: voice-assistant
-    # Host networking gives direct access to the llama.cpp server on the
-    # host (http://127.0.0.1:8080) and to ALSA audio devices.
-    network_mode: host
+    # Bridge networking with the host-gateway alias: the llama.cpp server on
+    # the host is reached via http://host.docker.internal:8080 and must
+    # listen on the bridge gateway (e.g. --host 0.0.0.0), not only loopback.
+    # ALSA audio devices still work via the devices: passthrough below.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./models:/models
-      - /dev/snd:/dev/snd
     environment:
       - WHISPER_MODEL=/models/whisper/ggml-small.en-q5_1.bin
       - PIPER_MODEL=/models/piper/en_US-ryan-high.onnx
       # Overridable via host env var or .env file (see .env.example)
       - WHISPER_THREADS=${WHISPER_THREADS:-}
-      - LLM_ENDPOINT=${LLM_ENDPOINT:-http://127.0.0.1:8080}
+      - LLM_ENDPOINT=${LLM_ENDPOINT:-http://host.docker.internal:8080}
       - LLM_MODEL=${LLM_MODEL:-}
       - LLM_SYSTEM_PROMPT=${LLM_SYSTEM_PROMPT:-}
       - DEBUG=false
     devices:
       - /dev/snd:/dev/snd
-    cap_add:
-      - SYS_NICE
+    # Host audio group (gid 29 on Ubuntu) so the non-root container user can
+    # open the /dev/snd devices.
+    group_add:
+      - "${AUDIO_GID:-29}"
     restart: unless-stopped

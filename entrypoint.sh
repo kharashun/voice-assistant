@@ -6,10 +6,11 @@ echo "=== Voice Assistant Startup ==="
 
 export WHISPER_MODEL="${WHISPER_MODEL:-/models/whisper/ggml-small.en-q5_1.bin}"
 export PIPER_MODEL="${PIPER_MODEL:-/models/piper/en_US-ryan-high.onnx}"
-# The container runs with network_mode: host, so the llama.cpp server on the
-# host is reachable via the loopback interface (host.docker.internal is only
-# resolvable on Docker's bridge networks, not in host mode on Linux).
-export LLM_ENDPOINT="${LLM_ENDPOINT:-http://127.0.0.1:8080}"
+# The container runs on a bridge network with the host-gateway alias, so the
+# llama.cpp server on the host is reachable via host.docker.internal (it must
+# listen on the Docker bridge gateway, e.g. --host 0.0.0.0, not only on
+# loopback).
+export LLM_ENDPOINT="${LLM_ENDPOINT:-http://host.docker.internal:8080}"
 
 echo "Config:"
 echo "  WHISPER_MODEL: $WHISPER_MODEL"
@@ -37,13 +38,13 @@ fi
 
 if [ ! -f "$WHISPER_MODEL" ]; then
     echo "ERROR: Whisper model not found at $WHISPER_MODEL"
-    echo "Please run: docker compose run --rm voice-assistant /app/install_models.sh"
+    echo "Please run: docker compose run --rm --user 0 voice-assistant /app/install_models.sh"
     exit 1
 fi
 
 if [ ! -f "$PIPER_MODEL" ] || [ ! -f "$PIPER_MODEL.json" ]; then
     echo "ERROR: Piper model not found at $PIPER_MODEL (expected $PIPER_MODEL and $PIPER_MODEL.json)"
-    echo "Please run: docker compose run --rm voice-assistant /app/install_models.sh"
+    echo "Please run: docker compose run --rm --user 0 voice-assistant /app/install_models.sh"
     exit 1
 fi
 

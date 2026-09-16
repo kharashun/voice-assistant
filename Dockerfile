@@ -84,5 +84,14 @@ COPY install_models.sh /app/install_models.sh
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh /app/install_models.sh
 
+# Non-root runtime user (uid 1000 matches the typical host user, so the
+# ./models bind mount stays readable). /dev/snd access comes from the host
+# audio group via compose group_add (AUDIO_GID). Model installs override
+# with: docker compose run --rm --user 0 voice-assistant /app/install_models.sh
+# Debian bookworm already ships a "voice" group (gid 22); reuse it as the
+# primary group instead of creating a user-private one of the same name.
+RUN useradd -u 1000 -m -g voice voice
+USER voice
+
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/app/voice-assistant"]
