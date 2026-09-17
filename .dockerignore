@@ -2,10 +2,11 @@
 .git
 .gitignore
 
-# Documentation
+# Documentation (THIRD_PARTY_NOTICES.md and the extension-less LICENSES/
+# files are COPYed into the image, so they must stay in the build context)
 *.md
 *.txt
-LICENSES
+!THIRD_PARTY_NOTICES.md
 
 # Build outputs
 build/

@@ -148,7 +148,8 @@ voice-assistant/
 ├── install_models.sh          # Model download script
 ├── start.sh                   # Quick start script
 ├── README.md                  # User documentation
-├── LICENSES/                  # Third-party licenses
+├── LICENSES/                  # Third-party license texts (whisper MIT, piper/espeak-ng GPL-3.0, onnxruntime MIT, GPL-2.0, LGPL-2.1)
+├── THIRD_PARTY_NOTICES.md     # Third-party components, licenses, and pinned source URLs
 ├── .dockerignore              # Docker ignore file
 ├── .env.example               # Template for .env overrides (LLM_ENDPOINT, WHISPER_THREADS, AUDIO_GID)
 └── models/                    # Mount point for models (host ./models)
@@ -220,6 +221,9 @@ voice-assistant/
   `.env.example`)
 - /dev/snd passthrough for ALSA audio
 - Volume mounts for models
+- LICENSE, THIRD_PARTY_NOTICES.md, and LICENSES/ are copied into the image at
+  /usr/share/licenses/voice-assistant/ (GPLv3 notice compliance when the
+  image is distributed)
 - Entrypoint passes through any command given via
   `docker compose run --rm voice-assistant <cmd>`
 
@@ -307,4 +311,15 @@ copying artifacts.
 
 ## License
 
-MIT
+MIT for this repository's own code (orchestrator.go, scripts, Dockerfile,
+compose files). The built image bundles third-party components under their
+own licenses: whisper.cpp (MIT), piper1-gpl + espeak-ng (GPL-3.0), onnxruntime
+(MIT), sox (GPL-2.0+/LGPL-2.1+), alsa-utils (GPL-2.0+), libasound2/libpulse0
+(LGPL-2.1+), wget (GPL-3.0+), curl (curl license). Full list with pinned
+sources: THIRD_PARTY_NOTICES.md; texts: LICENSES/ (also copied into the image
+at /usr/share/licenses/voice-assistant/ so notices accompany a distributed
+image, GPLv3 sections 4/6). Models are MIT: whisper weights per
+openai/whisper ("code and model weights are released under the MIT License"),
+piper voices per rhasspy/piper-voices. The Go toolchain (BSD-3-Clause) is
+builder-stage only. Keep .dockerignore's `!THIRD_PARTY_NOTICES.md` negation
+rule (against the `*.md` exclusion) — the Dockerfile COPYs it and LICENSES/.

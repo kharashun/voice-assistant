@@ -158,10 +158,50 @@ get `400: model name is missing from the request` — set `LLM_MODEL` in
 
 ## Licenses
 
-Voice Assistant: MIT
+**This repository's own code** (orchestrator.go, scripts, Dockerfile, compose
+files) is MIT — see [LICENSE](LICENSE). The built image bundles third-party
+components that remain under their own licenses: texts are in
+[LICENSES/](LICENSES), versions and pinned source URLs in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Both are shipped inside the
+image at `/usr/share/licenses/voice-assistant/`.
 
-### Third-party Licenses
+### Components built from source
 
-- **SoX**: GPL-2.0-or-later (see [LICENSES/LICENSE.GPL-2.0](LICENSES/LICENSE.GPL-2.0))
-- **Piper**: GPL-3.0 (see [LICENSES/LICENSE.GPL-3.0](LICENSES/LICENSE.GPL-3.0))
-- **Whisper.cpp**: MIT (see [LICENSES/LICENSE.MIT-whisper](LICENSES/LICENSE.MIT-whisper))
+| Component | License | Text |
+|-----------|---------|------|
+| whisper.cpp v1.9.4 (whisper-cli) | MIT | [LICENSE.MIT-whisper](LICENSES/LICENSE.MIT-whisper) |
+| piper1-gpl v1.8.0 (piper, libpiper) | GPL-3.0 | [LICENSE.GPL-3.0](LICENSES/LICENSE.GPL-3.0) |
+| espeak-ng (phonemization, linked into libpiper; espeak-ng-data) | GPL-3.0 | [LICENSE.GPL-3.0](LICENSES/LICENSE.GPL-3.0) |
+| onnxruntime (libonnxruntime.so) | MIT | [LICENSE.MIT-onnxruntime](LICENSES/LICENSE.MIT-onnxruntime) |
+
+### Debian bookworm packages (apt)
+
+| Package | License | Text |
+|---------|---------|------|
+| sox, libsox-fmt-alsa | GPL-2.0-or-later (CLI); LGPL-2.1-or-later (libsox) | [LICENSE.GPL-2.0](LICENSES/LICENSE.GPL-2.0), [LICENSE.LGPL-2.1](LICENSES/LICENSE.LGPL-2.1) |
+| alsa-utils (aplay, arecord) | GPL-2.0-or-later | [LICENSE.GPL-2.0](LICENSES/LICENSE.GPL-2.0) |
+| libasound2, libpulse0 | LGPL-2.1-or-later | [LICENSE.LGPL-2.1](LICENSES/LICENSE.LGPL-2.1) |
+| wget | GPL-3.0-or-later | [LICENSE.GPL-3.0](LICENSES/LICENSE.GPL-3.0) |
+| curl | curl license (MIT-style) | in image: `/usr/share/doc/curl/copyright` |
+| libgomp1, libstdc++6 | GPL-3.0+ with GCC runtime library exception | in image: `/usr/share/doc/*/copyright` |
+
+Debian keeps the license texts for its packages inside the image
+(`/usr/share/common-licenses/`, `/usr/share/doc/<pkg>/copyright`). The Go
+toolchain (BSD-3-Clause) is used in the builder stage only and is not part of
+the runtime image.
+
+### Models (downloaded by install_models.sh, not redistributed here)
+
+- **Whisper small.en-q5_1** (ggerganov/whisper.cpp): MIT — "Whisper's code and
+  model weights are released under the MIT License" (openai/whisper)
+- **Piper en_US-ryan-high** (rhasspy/piper-voices): MIT
+
+### Distribution notes
+
+The orchestrator interacts with the GPL binaries at arm's length (exec +
+stdin/files), so the MIT license on this repository's code stands. If you
+**distribute the built image**, GPLv3 requires the license text and
+corresponding source (or a written offer) to accompany the GPL components —
+the license texts ride along in the image, and the pinned source URLs in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) identify the exact
+corresponding sources.

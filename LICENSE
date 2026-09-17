@@ -19,3 +19,11 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Scope: this license applies to this repository's own code (orchestrator.go,
+scripts, Dockerfile, compose files). The built container image bundles
+third-party components (whisper.cpp, piper, espeak-ng, onnxruntime, sox,
+alsa-utils, and Debian packages) that remain under their own licenses — see
+THIRD_PARTY_NOTICES.md and LICENSES/.

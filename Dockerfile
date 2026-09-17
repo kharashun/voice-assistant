@@ -91,6 +91,14 @@ RUN chmod +x /entrypoint.sh /app/install_models.sh
 # Debian bookworm already ships a "voice" group (gid 22); reuse it as the
 # primary group instead of creating a user-private one of the same name.
 RUN useradd -u 1000 -m -g voice voice
+
+# Ship the project license, third-party license texts, and source attribution
+# inside the image so the notices accompany any distributed image (GPLv3
+# section 4; see THIRD_PARTY_NOTICES.md).
+COPY LICENSE /usr/share/licenses/voice-assistant/LICENSE
+COPY THIRD_PARTY_NOTICES.md /usr/share/licenses/voice-assistant/
+COPY LICENSES/ /usr/share/licenses/voice-assistant/
+
 USER voice
 
 ENTRYPOINT ["/entrypoint.sh"]
