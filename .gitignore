@@ -25,6 +25,9 @@ logs/
 # Local environment overrides (keep .env.example tracked)
 .env
 
+# Local notes (not a public roadmap)
+TODO.md
+
 # Editor/IDE
 .vscode/
 .idea/
