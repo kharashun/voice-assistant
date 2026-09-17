@@ -9,6 +9,7 @@ A low-latency voice assistant with speech-to-text (STT), LLM processing, and tex
 - **Text-to-Speech**: piper (C++ CLI, built from source)
 - **Total Latency**: fixed capture window (default 5s) + 3-4s processing (target)
 - **SoX**: Single command for 16kHz WAV capture
+- **Privacy by default**: STT and TTS run locally; transcripts are sent only to the configured `LLM_ENDPOINT` (a local llama.cpp by default, but it can point at any API)
 
 ## Architecture
 
@@ -16,7 +17,7 @@ A low-latency voice assistant with speech-to-text (STT), LLM processing, and tex
 Host (Ubuntu)
 ├── Microphone (ALSA)
 ├── Speaker (ALSA)
-└── llama.cpp API (localhost:8080, EXTERNAL)
+└── llama.cpp API (host.docker.internal:8080, EXTERNAL)
     └── Docker Container
         ├── voice-assistant (Go orchestrator)
         ├── whisper-cli (STT, CPU)
@@ -27,7 +28,8 @@ Host (Ubuntu)
 
 - Docker and Docker Compose
 - Host with microphone and speaker
-- llama.cpp server running on `localhost:8080`
+- llama.cpp server running on `host.docker.internal:8080` (listening on
+  all interfaces, e.g. `--host 0.0.0.0`)
 
 ## Quick Start
 
@@ -35,8 +37,8 @@ Host (Ubuntu)
 # Build the image
 docker compose build
 
-# Download models
-docker compose run --rm voice-assistant /app/install_models.sh
+# Download models (as root, since the script writes to the ./models volume)
+docker compose run --rm --user 0 voice-assistant /app/install_models.sh
 
 # Start the assistant
 docker compose up -d

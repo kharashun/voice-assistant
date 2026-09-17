@@ -146,8 +146,6 @@ voice-assistant/
 ├── install_models.sh          # Model download script
 ├── start.sh                   # Quick start script
 ├── README.md                  # User documentation
-├── IMPLEMENTATION_SPEC.md     # Implementation specification
-├── PERFORMANCE_IMPROVEMENTS.md# Optimization plan
 ├── LICENSES/                  # Third-party licenses
 ├── .dockerignore              # Docker ignore file
 ├── .env.example               # Template for .env overrides (LLM_ENDPOINT, WHISPER_THREADS, AUDIO_GID)
