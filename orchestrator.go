@@ -151,8 +151,8 @@ func loadConfig() *Config {
 	}
 }
 
-func debugLog(msg string) {
-	if os.Getenv("DEBUG") == "true" {
+func debugLog(c *Config, msg string) {
+	if c.Debug {
 		log.Println("[DEBUG]", msg)
 	}
 }
@@ -213,7 +213,7 @@ func captureAudio(config *Config) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read audio file: %w", err)
 	}
 
-	debugLog(fmt.Sprintf("Captured %d bytes of audio", len(wavData)))
+	debugLog(config, fmt.Sprintf("Captured %d bytes of audio", len(wavData)))
 
 	return wavData, nil
 }
@@ -253,7 +253,7 @@ func enoughSpeech(wav []byte, config *Config) bool {
 	// 16000 samples/s * 2 bytes/sample / 1000 = bytes per millisecond.
 	ms := dataSize / 32
 	if ms < uint32(config.VadMinSpeechMs) {
-		debugLog(fmt.Sprintf("Capture too short: %dms < %dms", ms, config.VadMinSpeechMs))
+		debugLog(config, fmt.Sprintf("Capture too short: %dms < %dms", ms, config.VadMinSpeechMs))
 		return false
 	}
 	return true
@@ -303,7 +303,7 @@ func sttWithWhisper(wavData []byte, config *Config) (string, error) {
 		if _, err := os.Stat(config.WhisperVadModel); err == nil {
 			cmd.Args = append(cmd.Args, "--vad", "--vad-model", config.WhisperVadModel)
 		} else {
-			debugLog(fmt.Sprintf("Whisper VAD model not found at %s, running without --vad", config.WhisperVadModel))
+			debugLog(config, fmt.Sprintf("Whisper VAD model not found at %s, running without --vad", config.WhisperVadModel))
 		}
 	}
 
@@ -318,12 +318,12 @@ func sttWithWhisper(wavData []byte, config *Config) (string, error) {
 	}
 
 	text := strings.TrimSpace(string(raw))
-	debugLog(fmt.Sprintf("STT result: %s", text))
+	debugLog(config, fmt.Sprintf("STT result: %s", text))
 
 	return text, nil
 }
 
-func callLLM(prompt string, config *Config) (string, error) {
+func buildLLMRequest(prompt string, config *Config) (*bytes.Buffer, error) {
 	messages := make([]ChatMessage, 0, 2)
 	if config.LLMSystemPrompt != "" {
 		messages = append(messages, ChatMessage{Role: "system", Content: config.LLMSystemPrompt})
@@ -336,22 +336,28 @@ func callLLM(prompt string, config *Config) (string, error) {
 		MaxTokens:   config.LLMMaxTokens,
 		Temperature: 0.7,
 	}
-	// llama.cpp has no "reasoning" request field; Qwen3-style chat
-	// templates disable thinking via the enable_thinking kwarg.
 	if config.LLMDisableReasoning {
 		req.ChatTemplateKwargs = map[string]bool{"enable_thinking": false}
 	}
 
 	jsonData, err := json.Marshal(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+	return bytes.NewBuffer(jsonData), nil
+}
+
+func callLLM(prompt string, config *Config) (string, error) {
+	reqBody, err := buildLLMRequest(prompt, config)
+	if err != nil {
+		return "", err
 	}
 
 	client := &http.Client{Timeout: config.LLMTimeout}
 	resp, err := client.Post(
 		config.LLMEndpoint+"/v1/chat/completions",
 		"application/json",
-		bytes.NewBuffer(jsonData),
+		reqBody,
 	)
 	if err != nil {
 		return "", fmt.Errorf("failed to call LLM: %w", err)
@@ -367,8 +373,17 @@ func callLLM(prompt string, config *Config) (string, error) {
 		return "", fmt.Errorf("LLM returned status %d: %s", resp.StatusCode, string(body))
 	}
 
+	content, err := parseLLMResponse(body)
+	if err != nil {
+		return "", err
+	}
+	debugLog(config, fmt.Sprintf("LLM response: %s", content))
+	return content, nil
+}
+
+func parseLLMResponse(body []byte) (string, error) {
 	var llmResp LLMResponse
-	err = json.Unmarshal(body, &llmResp)
+	err := json.Unmarshal(body, &llmResp)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse LLM response: %w, body: %s", err, string(body))
 	}
@@ -381,7 +396,6 @@ func callLLM(prompt string, config *Config) (string, error) {
 		log.Printf("LLM returned empty content (finish_reason=%s, reasoning_content=%d chars); thinking may have consumed the token budget - raise LLM_MAX_TOKENS or keep reasoning disabled",
 			llmResp.Choices[0].FinishReason, len(llmResp.Choices[0].Message.ReasoningContent))
 	}
-	debugLog(fmt.Sprintf("LLM response: %s", content))
 
 	return content, nil
 }
@@ -414,7 +428,7 @@ func ttsWithPiper(text string, config *Config) ([]byte, error) {
 		return nil, fmt.Errorf("failed to read audio file: %w", err)
 	}
 
-	debugLog(fmt.Sprintf("Generated %d bytes of audio", len(audioData)))
+	debugLog(config, fmt.Sprintf("Generated %d bytes of audio", len(audioData)))
 
 	return audioData, nil
 }
@@ -519,7 +533,7 @@ func main() {
 		// [SOUND], ...) on background noise; strip them so they never
 		// reach the LLM, and skip the turn if nothing real remains.
 		if cleaned := stripNonSpeechTags(text); cleaned != text {
-			debugLog(fmt.Sprintf("Stripped non-speech tags from: %s", text))
+			debugLog(config, fmt.Sprintf("Stripped non-speech tags from: %s", text))
 			text = cleaned
 			if text == "" {
 				fmt.Println("No speech detected (non-speech tags only). Listening again...")
