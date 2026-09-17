@@ -40,6 +40,8 @@ Debian keeps the license texts for these packages inside the image
 
 - Whisper small.en-q5_1 (ggerganov/whisper.cpp): MIT - "Whisper's code and
   model weights are released under the MIT License" (openai/whisper)
+- whisper silero VAD (ggml-org/whisper-vad): MIT - Copyright (c) 2020-present
+  Silero Team (source: snakers4/silero-vad)
 - Piper voice en_US-ryan-high (rhasspy/piper-voices): MIT
   (https://huggingface.co/rhasspy/piper-voices)
 

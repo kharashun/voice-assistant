@@ -17,6 +17,13 @@ services:
       - PIPER_MODEL=/models/piper/en_US-ryan-high.onnx
       # Overridable via host env var or .env file (see .env.example)
       - WHISPER_THREADS=${WHISPER_THREADS:-}
+      - WHISPER_VAD_MODEL=${WHISPER_VAD_MODEL:-/models/whisper/ggml-silero-v5.1.2.bin}
+      - CAPTURE_MODE=${CAPTURE_MODE:-vad}
+      - VAD_THRESHOLD=${VAD_THRESHOLD:-}
+      - VAD_START_MS=${VAD_START_MS:-}
+      - VAD_SILENCE_SEC=${VAD_SILENCE_SEC:-}
+      - VAD_MAX_UTTERANCE_SEC=${VAD_MAX_UTTERANCE_SEC:-}
+      - VAD_MIN_SPEECH_MS=${VAD_MIN_SPEECH_MS:-}
       - LLM_ENDPOINT=${LLM_ENDPOINT:-http://host.docker.internal:8080}
       - LLM_MODEL=${LLM_MODEL:-}
       - LLM_SYSTEM_PROMPT=${LLM_SYSTEM_PROMPT:-}

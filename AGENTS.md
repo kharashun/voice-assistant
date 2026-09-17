@@ -7,7 +7,8 @@ This is a **low-latency voice assistant** system for Ubuntu that provides:
 - **LLM Processing**: Calls local llama.cpp API endpoint
 - **Text-to-Speech (TTS)**: piper (C++ CLI, built from source)
 
-**Processing latency target (after the fixed capture window): 3-4 seconds.**
+**Processing latency target (after capture, which ends ~2s after speech
+stops): 3-4 seconds.**
 
 ## Architecture
 
@@ -35,9 +36,12 @@ All services run in **a single combined container** for minimal overhead:
 ```
 Host Mic (ALSA default device)
     ↓
-sox -d → 16kHz mono 16-bit WAV (fixed capture window, default 5s)
+sox -d → 16kHz mono 16-bit WAV (voice-activated capture via the sox
+`silence` effect: waits for speech, records until ~2s of quiet, 30s cap;
+CAPTURE_MODE=fixed restores the old fixed window)
     ↓
-whisper-cli (STT) → transcript file (<base>.txt via -of/-otxt)
+whisper-cli (STT with built-in Silero VAD; non-speech segments are
+dropped before whisper_full) → transcript file (<base>.txt via -of/-otxt)
     ↓
 HTTP POST to llama.cpp host.docker.internal:8080/v1/chat/completions
     ↓
@@ -75,7 +79,14 @@ docker compose up -d
 | `LLM_TIMEOUT` | `30s` | LLM request timeout (Go duration) |
 | `LLM_DISABLE_REASONING` | _(on)_ | Sends `chat_template_kwargs {"enable_thinking": false}` to disable thinking; honored by Qwen3-style chat templates. Set `false` to allow reasoning (then raise `LLM_MAX_TOKENS`) |
 | `LLM_MAX_TOKENS` | `512` | Reply token budget; a thinking model needs ~400+ (reasoning + answer), lower (e.g. 100) to cap latency once reasoning is off |
-| `CAPTURE_SECONDS` | `5` | Fixed audio capture window in seconds |
+| `CAPTURE_MODE` | `vad` | `vad` = silence-triggered capture via the sox `silence` effect; `fixed` = fixed window via `CAPTURE_SECONDS` |
+| `CAPTURE_SECONDS` | `5` | Fixed audio capture window in seconds (used by `CAPTURE_MODE=fixed`) |
+| `VAD_THRESHOLD` | `10` | sox amplitude threshold (%) for speech start/stop; tune per mic/room (overridable via host env var or `.env`) |
+| `VAD_START_MS` | `100` | Sound duration (ms) above the threshold that starts the recording |
+| `VAD_SILENCE_SEC` | `2.0` | Quiet duration (s) below the threshold that ends the utterance |
+| `VAD_MAX_UTTERANCE_SEC` | `30` | Hard cap on one utterance (sox `trim`), so constant noise cannot record forever |
+| `VAD_MIN_SPEECH_MS` | `500` | Captures shorter than this are skipped before STT (transient noise, not speech) |
+| `WHISPER_VAD_MODEL` | `/models/whisper/ggml-silero-v5.1.2.bin` | whisper.cpp Silero VAD model (ggml); a missing file disables `--vad` |
 | `WHISPER_BIN` | `/app/whisper-cli` | whisper-cli binary path |
 | `PIPER_BIN` | `/app/piper` | piper binary path |
 | `ESPEAK_DATA` | `/opt/espeak-ng-data` | espeak-ng data dir for piper |
@@ -108,11 +119,11 @@ docker compose run --rm voice-assistant aplay -l
 
 | Component | Target Latency | Notes |
 |-----------|----------------|-------|
-| **Total (end-to-end)** | capture window + 3-4s | Includes the fixed 5s capture window |
+| **Total (end-to-end)** | utterance + 2s tail + 3-4s | Capture ends ~2s after speech stops (VAD_SILENCE_SEC) |
 | Whisper STT | <1500ms | small.en-q5_1 model, Release build (4 threads by default; raise `WHISPER_THREADS` to cut this) |
 | LLM inference | <1500ms | via llama.cpp |
 | Piper TTS | <1000ms | ryan-high model, CLI mode, model loaded per call |
-| Audio capture | fixed 5s window | `CAPTURE_SECONDS`, no VAD yet |
+| Audio capture | utterance + 2s tail | Voice-activated (sox `silence` effect, 30s cap); the wait for speech is free - sox blocks on the mic, no whisper inference is burned on silence |
 
 The orchestrator measures latency from the start of capture and reports
 capture time and processing time separately.
@@ -122,6 +133,7 @@ capture time and processing time separately.
 | Model | Size | Description |
 |-------|------|-------------|
 | whisper small.en-q5_1 | 190MB | Quantized English STT model; far better accuracy than tiny.en |
+| whisper silero VAD | 0.9MB | Silero VAD in ggml format; whisper.cpp drops non-speech segments before whisper_full |
 | piper en_US-ryan-high | 120MB | Highest-quality male English TTS voice (+ .onnx.json config) |
 
 Models are downloaded from HuggingFace by `install_models.sh` into the
@@ -151,7 +163,7 @@ voice-assistant/
 ├── LICENSES/                  # Third-party license texts (whisper MIT, piper/espeak-ng GPL-3.0, onnxruntime MIT, GPL-2.0, LGPL-2.1)
 ├── THIRD_PARTY_NOTICES.md     # Third-party components, licenses, and pinned source URLs
 ├── .dockerignore              # Docker ignore file
-├── .env.example               # Template for .env overrides (LLM_ENDPOINT, WHISPER_THREADS, AUDIO_GID)
+├── .env.example               # Template for .env overrides (LLM_*, WHISPER_THREADS, VAD_* capture tuning, AUDIO_GID)
 └── models/                    # Mount point for models (host ./models)
     ├── whisper/
     └── piper/
@@ -160,12 +172,27 @@ voice-assistant/
 ## Key Implementation Details
 
 ### Orchestrator (Go)
-- Captures audio via `sox -d` directly as 16kHz mono WAV (single process)
+- Captures audio via `sox -d` directly as 16kHz mono WAV (single process).
+  In `vad` mode (default) the sox `silence` effect endpointing waits for
+  speech (unbounded, free - sox blocks on the mic), records until
+  `VAD_SILENCE_SEC` of quiet, and caps the utterance at
+  `VAD_MAX_UTTERANCE_SEC` via sox `trim`; `CAPTURE_MODE=fixed` restores the
+  old fixed window (`CAPTURE_SECONDS`). sox durations are formatted with a
+  decimal point - bare integers are parsed as sample counts
+- Skips STT entirely when a vad-mode capture is shorter than
+  `VAD_MIN_SPEECH_MS` (transient noise started the recording, no speech
+  followed)
 - Calls whisper-cli, reads the transcript from the `-of <base> -otxt` file
   (never parses the binary's log output)
 - Passes `-t $WHISPER_THREADS` to whisper-cli when `WHISPER_THREADS` is set
   (whisper-cli otherwise defaults to 4 threads)
+- Passes `--vad --vad-model $WHISPER_VAD_MODEL` to whisper-cli when the
+  Silero VAD model file exists, so non-speech segments are dropped before
+  whisper_full (missing file = flag omitted, graceful degradation)
 - Skips the LLM when whisper reports silence (`[BLANK_AUDIO]` or empty text)
+- Strips bracketed non-speech tags (`[typing]`, `[SOUND]`, ...) whisper
+  hallucinates on noise before `callLLM`; skips the turn when nothing real
+  remains
 - POSTs to llama.cpp `/v1/chat/completions` (system + user message) with a
   configurable timeout and status-code check
 - Sends `LLM_MODEL` in the request body: required when the llama.cpp
@@ -186,6 +213,10 @@ voice-assistant/
 - Built from source (ggml-org/whisper.cpp, pinned v1.9.4)
 - CPU only, no SDL2, no FFmpeg (input is plain WAV), statically linked
   (`BUILD_SHARED_LIBS=OFF`) - single self-contained binary
+- Built-in Silero VAD (`--vad`) is passed when the ggml VAD model exists;
+  non-speech segments are dropped before whisper_full, which avoids
+  hallucinated non-speech tags on noise and speeds up inference. The VAD
+  model is downloaded by `install_models.sh` (see Models)
 - small.en-q5_1 model (quantized) for far better accuracy at moderate
   inference speed, Release build
 
@@ -214,9 +245,10 @@ voice-assistant/
   typical host user so the `./models` bind mount stays readable); the host
   audio group is added via `group_add: ${AUDIO_GID:-29}` for `/dev/snd`
   access, and model installs use `--user 0` (see Build Instructions)
-- `LLM_ENDPOINT`, `LLM_MODEL`, `LLM_SYSTEM_PROMPT`, `LLM_DISABLE_REASONING`
-  and `LLM_MAX_TOKENS` are passed through
-  in docker-compose.yml (e.g. `${LLM_ENDPOINT:-http://host.docker.internal:8080}`),
+- `LLM_ENDPOINT`, `LLM_MODEL`, `LLM_SYSTEM_PROMPT`, `LLM_DISABLE_REASONING`,
+  `LLM_MAX_TOKENS`, `WHISPER_THREADS`, `WHISPER_VAD_MODEL` and the
+  `CAPTURE_MODE`/`VAD_*` capture variables are passed through in
+  docker-compose.yml (e.g. `${LLM_ENDPOINT:-http://host.docker.internal:8080}`),
   so they can be overridden via host env vars or a `.env` file (see
   `.env.example`)
 - /dev/snd passthrough for ALSA audio
@@ -234,8 +266,12 @@ voice-assistant/
 # Check ALSA devices
 docker compose run --rm voice-assistant aplay -l
 
-# Test microphone (5s recording)
+# Test microphone (5s fixed recording)
 docker compose run --rm voice-assistant bash -c 'sox -d -r 16000 -c 1 -b 16 /tmp/test.wav trim 0 5'
+
+# Test voice-activated capture (waits for speech, stops ~2s after quiet;
+# prints the recorded duration)
+docker compose run --rm voice-assistant bash -c 'sox -d -r 16000 -c 1 -b 16 -t wav /tmp/vad.wav silence 1 0.1 3% 1 2.0 3% trim 0 10 && soxi -D /tmp/vad.wav'
 ```
 
 ### Model Issues

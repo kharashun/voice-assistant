@@ -5,9 +5,11 @@ A low-latency voice assistant with speech-to-text (STT), LLM processing, and tex
 ## Features
 
 - **Speech-to-Text**: whisper.cpp (CPU, small.en-q5_1 model)
+- **Voice-activated capture**: sox `silence` effect — the assistant waits for speech, records your utterance, and stops ~2s after you pause (no fixed window, no timing your speech)
+- **Noise robustness**: whisper.cpp's built-in Silero VAD drops non-speech segments (keyboard/background noise) before transcription
 - **LLM Processing**: Calls local llama.cpp API
 - **Text-to-Speech**: piper (C++ CLI, built from source)
-- **Total Latency**: fixed capture window (default 5s) + 3-4s processing (target)
+- **Total Latency**: utterance + ~2s end-of-speech wait + 3-4s processing (target)
 - **SoX**: Single command for 16kHz WAV capture
 - **Privacy by default**: STT and TTS run locally; transcripts are sent only to the configured `LLM_ENDPOINT` (a local llama.cpp by default, but it can point at any API)
 
@@ -62,6 +64,7 @@ Environment variables (all optional, see AGENTS.md for the full table):
 
 - `WHISPER_MODEL`: Path to whisper model (default: `/models/whisper/ggml-small.en-q5_1.bin`)
 - `WHISPER_THREADS`: CPU threads for whisper-cli's `-t` flag (default: unset = whisper-cli's default of 4)
+- `WHISPER_VAD_MODEL`: whisper.cpp Silero VAD model for `--vad` (default: `/models/whisper/ggml-silero-v5.1.2.bin`; a missing file disables the flag)
 - `PIPER_MODEL`: Path to piper model (default: `/models/piper/en_US-ryan-high.onnx`)
 - `LLM_ENDPOINT`: LLM API endpoint (default: `http://host.docker.internal:8080` - bridge network with host-gateway alias; the host server must listen on the bridge gateway, e.g. `--host 0.0.0.0`)
 - `LLM_MODEL`: Model name sent with every request (required for llama.cpp router mode, e.g. `--models-dir`; default: empty)
@@ -69,7 +72,13 @@ Environment variables (all optional, see AGENTS.md for the full table):
 - `LLM_TIMEOUT`: LLM request timeout (default: `30s`)
 - `LLM_DISABLE_REASONING`: Disable thinking/reasoning mode via `chat_template_kwargs` `{"enable_thinking": false}` (honored by Qwen3-style templates; a thinking model otherwise burns the whole token budget and returns an empty answer) (default: on; set `false` to allow reasoning)
 - `LLM_MAX_TOKENS`: Token budget per reply (default: `512`; lower, e.g. `100`, to cap latency once reasoning is disabled)
-- `CAPTURE_SECONDS`: Fixed capture window in seconds (default: `5`)
+- `CAPTURE_MODE`: `vad` (voice-activated capture, default) or `fixed` (fixed window)
+- `VAD_THRESHOLD`: sox amplitude threshold in percent for speech start/stop (default: `10`; tune for your mic/room)
+- `VAD_START_MS`: sound duration that starts the recording (default: `100`)
+- `VAD_SILENCE_SEC`: quiet duration that ends the utterance (default: `2.0`; lower = snappier but cuts off thinking pauses)
+- `VAD_MAX_UTTERANCE_SEC`: hard cap on one utterance (default: `30`)
+- `VAD_MIN_SPEECH_MS`: captures shorter than this are skipped before STT (default: `500`)
+- `CAPTURE_SECONDS`: fixed capture window in seconds for `CAPTURE_MODE=fixed` (default: `5`)
 - `DEBUG`: Enable debug logging (default: `false`)
 - `AUDIO_GID`: Host audio group GID for `/dev/snd` access as the non-root container user (default: `29`)
 
@@ -96,11 +105,13 @@ docker compose up
 | Model | Size | Description |
 |-------|------|-------------|
 | whisper small.en-q5_1 | 190MB | Quantized English STT model (far better accuracy than tiny.en) |
+| whisper silero VAD | 0.9MB | Silero VAD in ggml format; whisper.cpp drops non-speech segments before transcription |
 | piper en_US-ryan-high | 120MB | Highest-quality male English TTS voice (+ .onnx.json config) |
 
 ## Performance Targets
 
-- **Total latency**: fixed 5s capture window + 3-4s processing
+- **Total latency**: utterance length + ~2s end-of-speech wait + 3-4s processing
+- **Audio capture**: voice-activated; waiting for speech is free (sox blocks on the mic), no whisper inference burned on silence
 - **Whisper STT**: <1500ms (4 threads by default; raise `WHISPER_THREADS` to cut this)
 - **LLM inference**: <1500ms (via llama.cpp)
 - **Piper TTS**: <1000ms
@@ -135,6 +146,18 @@ Check that ALSA devices are visible inside the container:
 ```bash
 docker compose run --rm voice-assistant aplay -l
 ```
+
+### Voice-activated capture misbehaves
+
+Test the sox silence-effect chain directly — it should wait for speech,
+stop ~2s after you stop talking, and print the recorded duration:
+```bash
+docker compose run --rm voice-assistant bash -c 'sox -d -r 16000 -c 1 -b 16 -t wav /tmp/vad.wav silence 1 0.1 3% 1 2.0 3% trim 0 10 && soxi -D /tmp/vad.wav'
+```
+
+If recording starts on background noise, or never starts on speech, tune
+`VAD_THRESHOLD` in `.env` (higher = less sensitive). `CAPTURE_MODE=fixed`
+restores the old fixed-window behavior while you experiment.
 
 ### Model not found
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +44,7 @@ type Config struct {
 	WhisperBin          string
 	WhisperModel        string
 	WhisperThreads      int
+	WhisperVadModel     string
 	PiperBin            string
 	PiperModel          string
 	EspeakData          string
@@ -51,7 +54,13 @@ type Config struct {
 	LLMTimeout          time.Duration
 	LLMDisableReasoning bool
 	LLMMaxTokens        int
-	CaptureSeconds      int
+	CaptureMode         string  // "vad" (silence-triggered) or "fixed" (fixed window)
+	CaptureSeconds      int     // fixed mode: window length in seconds
+	VadThreshold        float64 // sox amplitude threshold in percent
+	VadStartMs          int     // sound duration that starts the recording
+	VadSilenceSec       float64 // quiet duration that ends the recording
+	VadMaxUtteranceSec  int     // hard cap on utterance length
+	VadMinSpeechMs      int     // captures shorter than this are skipped before STT
 	Debug               bool
 }
 
@@ -87,10 +96,41 @@ func loadConfig() *Config {
 	// On unless explicitly set to "false".
 	llmDisableReasoning := os.Getenv("LLM_DISABLE_REASONING") != "false"
 
+	captureMode := getenv("CAPTURE_MODE", "vad")
+	if captureMode != "vad" && captureMode != "fixed" {
+		captureMode = "vad"
+	}
+
+	vadThreshold, err := strconv.ParseFloat(getenv("VAD_THRESHOLD", "10"), 64)
+	if err != nil || vadThreshold <= 0 || vadThreshold > 100 {
+		vadThreshold = 10
+	}
+
+	vadStartMs, err := strconv.Atoi(getenv("VAD_START_MS", "100"))
+	if err != nil || vadStartMs <= 0 {
+		vadStartMs = 100
+	}
+
+	vadSilenceSec, err := strconv.ParseFloat(getenv("VAD_SILENCE_SEC", "2.0"), 64)
+	if err != nil || vadSilenceSec <= 0 {
+		vadSilenceSec = 2.0
+	}
+
+	vadMaxUtteranceSec, err := strconv.Atoi(getenv("VAD_MAX_UTTERANCE_SEC", "30"))
+	if err != nil || vadMaxUtteranceSec <= 0 {
+		vadMaxUtteranceSec = 30
+	}
+
+	vadMinSpeechMs, err := strconv.Atoi(getenv("VAD_MIN_SPEECH_MS", "500"))
+	if err != nil || vadMinSpeechMs < 0 {
+		vadMinSpeechMs = 500
+	}
+
 	return &Config{
 		WhisperBin:          getenv("WHISPER_BIN", "/app/whisper-cli"),
 		WhisperModel:        getenv("WHISPER_MODEL", "/models/whisper/ggml-small.en-q5_1.bin"),
 		WhisperThreads:      whisperThreads,
+		WhisperVadModel:     getenv("WHISPER_VAD_MODEL", "/models/whisper/ggml-silero-v5.1.2.bin"),
 		PiperBin:            getenv("PIPER_BIN", "/app/piper"),
 		PiperModel:          getenv("PIPER_MODEL", "/models/piper/en_US-ryan-high.onnx"),
 		EspeakData:          getenv("ESPEAK_DATA", "/opt/espeak-ng-data"),
@@ -100,7 +140,13 @@ func loadConfig() *Config {
 		LLMTimeout:          llmTimeout,
 		LLMDisableReasoning: llmDisableReasoning,
 		LLMMaxTokens:        llmMaxTokens,
+		CaptureMode:         captureMode,
 		CaptureSeconds:      captureSeconds,
+		VadThreshold:        vadThreshold,
+		VadStartMs:          vadStartMs,
+		VadSilenceSec:       vadSilenceSec,
+		VadMaxUtteranceSec:  vadMaxUtteranceSec,
+		VadMinSpeechMs:      vadMinSpeechMs,
 		Debug:               os.Getenv("DEBUG") == "true",
 	}
 }
@@ -111,21 +157,51 @@ func debugLog(msg string) {
 	}
 }
 
+// soxDuration formats seconds for sox effect parameters. A bare integer
+// like "2" is parsed as a sample count by sox, so always carry a decimal
+// point ("2.0").
+func soxDuration(seconds float64) string {
+	s := strconv.FormatFloat(seconds, 'f', -1, 64)
+	if !strings.Contains(s, ".") {
+		s += ".0"
+	}
+	return s
+}
+
 func captureAudio(config *Config) ([]byte, error) {
 	// Use sox to capture from the ALSA default device directly as 16kHz WAV
 	tmpFile := fmt.Sprintf("/tmp/%d.wav", time.Now().UnixNano())
 	defer os.Remove(tmpFile)
 
-	cmd := exec.Command(
-		"sox",
+	args := []string{
 		"-d",          // default audio device
 		"-r", "16000", // 16kHz sample rate
 		"-c", "1", // mono
 		"-b", "16", // 16-bit
 		"-t", "wav", // WAV format
-		tmpFile,                                          // output file
-		"trim", "0", strconv.Itoa(config.CaptureSeconds), // record a fixed window
-	)
+		tmpFile, // output file
+	}
+	if config.CaptureMode == "vad" {
+		// Voice-activated capture via the sox `silence` effect:
+		// - discard audio until VadStartMs of sound above the threshold
+		//   starts the recording (the wait for speech is unbounded and
+		//   free - sox just blocks on the mic),
+		// - stop the recording after VadSilenceSec of quiet below it.
+		// `trim` after `silence` caps the utterance length so constant
+		// noise cannot keep the recording running forever.
+		threshold := fmt.Sprintf("%g%%", config.VadThreshold)
+		args = append(args,
+			"silence",
+			"1", soxDuration(float64(config.VadStartMs)/1000), threshold,
+			"1", soxDuration(config.VadSilenceSec), threshold,
+			"trim", "0", soxDuration(float64(config.VadMaxUtteranceSec)),
+		)
+	} else {
+		// Fixed window: record a fixed number of seconds.
+		args = append(args, "trim", "0", soxDuration(float64(config.CaptureSeconds)))
+	}
+
+	cmd := exec.Command("sox", args...)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -140,6 +216,58 @@ func captureAudio(config *Config) ([]byte, error) {
 	debugLog(fmt.Sprintf("Captured %d bytes of audio", len(wavData)))
 
 	return wavData, nil
+}
+
+// wavDataSize returns the byte size of the data chunk of a RIFF/WAVE
+// file. sox may write extra chunks (e.g. LIST) before it, so walk the
+// chunk list instead of assuming the canonical 44-byte header.
+func wavDataSize(wav []byte) (uint32, error) {
+	if len(wav) < 12 || string(wav[0:4]) != "RIFF" || string(wav[8:12]) != "WAVE" {
+		return 0, fmt.Errorf("not a RIFF/WAVE file")
+	}
+	off := uint32(12)
+	for off+8 <= uint32(len(wav)) {
+		id := string(wav[off : off+4])
+		size := binary.LittleEndian.Uint32(wav[off+4 : off+8])
+		if id == "data" {
+			return size, nil
+		}
+		// Chunks are word-aligned: odd sizes carry one pad byte.
+		off += 8 + size + (size & 1)
+	}
+	return 0, fmt.Errorf("no data chunk found")
+}
+
+// enoughSpeech reports whether the captured WAV holds at least
+// VadMinSpeechMs of audio. In vad mode a shorter capture means a
+// transient (cough, keyboard clack) triggered the recording but no
+// speech followed - it is skipped before whisper runs.
+func enoughSpeech(wav []byte, config *Config) bool {
+	dataSize, err := wavDataSize(wav)
+	if err != nil {
+		// Unparseable header: let whisper decide instead of dropping
+		// the turn outright.
+		log.Printf("Could not parse WAV header: %v", err)
+		return true
+	}
+	// 16000 samples/s * 2 bytes/sample / 1000 = bytes per millisecond.
+	ms := dataSize / 32
+	if ms < uint32(config.VadMinSpeechMs) {
+		debugLog(fmt.Sprintf("Capture too short: %dms < %dms", ms, config.VadMinSpeechMs))
+		return false
+	}
+	return true
+}
+
+// nonSpeechTagRe matches bracketed tags whisper emits instead of a
+// transcript on non-speech input ([BLANK_AUDIO], [MUSIC], [SOUND],
+// [typing], ...). They must never reach the LLM.
+var nonSpeechTagRe = regexp.MustCompile(`(?i)\[[^\]]*\]`)
+
+// stripNonSpeechTags removes bracketed non-speech tags and trims the
+// remaining text.
+func stripNonSpeechTags(text string) string {
+	return strings.TrimSpace(nonSpeechTagRe.ReplaceAllString(text, ""))
 }
 
 func sttWithWhisper(wavData []byte, config *Config) (string, error) {
@@ -166,6 +294,17 @@ func sttWithWhisper(wavData []byte, config *Config) (string, error) {
 	)
 	if config.WhisperThreads > 0 {
 		cmd.Args = append(cmd.Args, "-t", strconv.Itoa(config.WhisperThreads))
+	}
+	// whisper.cpp ships a built-in Silero VAD: with --vad it drops
+	// non-speech segments before whisper_full, which avoids hallucinated
+	// non-speech tags on background noise and speeds up inference.
+	// Only enabled when the model file actually exists.
+	if config.WhisperVadModel != "" {
+		if _, err := os.Stat(config.WhisperVadModel); err == nil {
+			cmd.Args = append(cmd.Args, "--vad", "--vad-model", config.WhisperVadModel)
+		} else {
+			debugLog(fmt.Sprintf("Whisper VAD model not found at %s, running without --vad", config.WhisperVadModel))
+		}
 	}
 
 	output, err := cmd.CombinedOutput()
@@ -307,6 +446,13 @@ func main() {
 	if config.WhisperThreads > 0 {
 		log.Printf("Whisper threads: %d", config.WhisperThreads)
 	}
+	if config.WhisperVadModel != "" {
+		if _, err := os.Stat(config.WhisperVadModel); err == nil {
+			log.Printf("Whisper VAD model: %s", config.WhisperVadModel)
+		} else {
+			log.Printf("Whisper VAD model missing (%s); STT runs without --vad", config.WhisperVadModel)
+		}
+	}
 	log.Printf("Piper model: %s", config.PiperModel)
 	log.Printf("LLM endpoint: %s", config.LLMEndpoint)
 	if config.LLMModel != "" {
@@ -315,12 +461,22 @@ func main() {
 	if config.LLMDisableReasoning {
 		log.Println("LLM thinking disabled (enable_thinking=false)")
 	}
+	if config.CaptureMode == "vad" {
+		log.Printf("Capture: voice-activated (threshold %g%%, stop after %ss of silence, max utterance %ds)",
+			config.VadThreshold, soxDuration(config.VadSilenceSec), config.VadMaxUtteranceSec)
+	} else {
+		log.Printf("Capture: fixed %ds window", config.CaptureSeconds)
+	}
 
 	fmt.Println("Voice Assistant ready! Press Ctrl+C to exit.")
 	fmt.Println()
 
 	for {
-		fmt.Printf("Listening... (%ds window)\n", config.CaptureSeconds)
+		if config.CaptureMode == "vad" {
+			fmt.Println("Listening... (speak, then pause)")
+		} else {
+			fmt.Printf("Listening... (%ds window)\n", config.CaptureSeconds)
+		}
 
 		// Measure end-to-end, including the capture window.
 		startTime := time.Now()
@@ -328,9 +484,19 @@ func main() {
 		wavData, err := captureAudio(config)
 		if err != nil {
 			log.Printf("Failed to capture audio: %v", err)
+			// Back off so a persistently unavailable mic (busy device,
+			// hot-unplug) cannot spin this loop hot.
+			time.Sleep(time.Second)
 			continue
 		}
 		captureTime := time.Since(startTime)
+
+		// In vad mode a too-short capture is a transient that started
+		// the recording but contains no speech - skip STT entirely.
+		if config.CaptureMode == "vad" && !enoughSpeech(wavData, config) {
+			fmt.Println("No speech detected (capture too short). Listening again...")
+			continue
+		}
 
 		fmt.Println("Processing...")
 
@@ -347,6 +513,18 @@ func main() {
 		if t := strings.TrimSpace(text); t == "" || t == "[BLANK_AUDIO]" {
 			fmt.Println("No speech detected. Listening again...")
 			continue
+		}
+
+		// whisper also emits bracketed non-speech tags ([typing],
+		// [SOUND], ...) on background noise; strip them so they never
+		// reach the LLM, and skip the turn if nothing real remains.
+		if cleaned := stripNonSpeechTags(text); cleaned != text {
+			debugLog(fmt.Sprintf("Stripped non-speech tags from: %s", text))
+			text = cleaned
+			if text == "" {
+				fmt.Println("No speech detected (non-speech tags only). Listening again...")
+				continue
+			}
 		}
 
 		response, err := callLLM(text, config)
