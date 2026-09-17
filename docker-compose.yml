@@ -20,6 +20,8 @@ services:
       - LLM_ENDPOINT=${LLM_ENDPOINT:-http://host.docker.internal:8080}
       - LLM_MODEL=${LLM_MODEL:-}
       - LLM_SYSTEM_PROMPT=${LLM_SYSTEM_PROMPT:-}
+      - LLM_DISABLE_REASONING=${LLM_DISABLE_REASONING:-}
+      - LLM_MAX_TOKENS=${LLM_MAX_TOKENS:-}
       - DEBUG=false
     devices:
       - /dev/snd:/dev/snd

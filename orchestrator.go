@@ -20,31 +20,39 @@ type ChatMessage struct {
 }
 
 type LLMRequest struct {
-	Model       string        `json:"model,omitempty"`
-	Messages    []ChatMessage `json:"messages"`
-	MaxTokens   int           `json:"max_tokens"`
-	Temperature float64       `json:"temperature"`
+	Model              string          `json:"model,omitempty"`
+	Messages           []ChatMessage   `json:"messages"`
+	MaxTokens          int             `json:"max_tokens"`
+	Temperature        float64         `json:"temperature"`
+	ChatTemplateKwargs map[string]bool `json:"chat_template_kwargs,omitempty"`
 }
 
 type LLMResponse struct {
 	Choices []struct {
-		Message ChatMessage `json:"message"`
+		Message struct {
+			Role             string `json:"role"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 }
 
 type Config struct {
-	WhisperBin      string
-	WhisperModel    string
-	WhisperThreads  int
-	PiperBin        string
-	PiperModel      string
-	EspeakData      string
-	LLMEndpoint     string
-	LLMModel        string
-	LLMSystemPrompt string
-	LLMTimeout      time.Duration
-	CaptureSeconds  int
-	Debug           bool
+	WhisperBin          string
+	WhisperModel        string
+	WhisperThreads      int
+	PiperBin            string
+	PiperModel          string
+	EspeakData          string
+	LLMEndpoint         string
+	LLMModel            string
+	LLMSystemPrompt     string
+	LLMTimeout          time.Duration
+	LLMDisableReasoning bool
+	LLMMaxTokens        int
+	CaptureSeconds      int
+	Debug               bool
 }
 
 func getenv(key, def string) string {
@@ -71,19 +79,29 @@ func loadConfig() *Config {
 		whisperThreads = 0
 	}
 
+	llmMaxTokens, err := strconv.Atoi(getenv("LLM_MAX_TOKENS", "512"))
+	if err != nil || llmMaxTokens <= 0 {
+		llmMaxTokens = 512
+	}
+
+	// On unless explicitly set to "false".
+	llmDisableReasoning := os.Getenv("LLM_DISABLE_REASONING") != "false"
+
 	return &Config{
-		WhisperBin:      getenv("WHISPER_BIN", "/app/whisper-cli"),
-		WhisperModel:    getenv("WHISPER_MODEL", "/models/whisper/ggml-small.en-q5_1.bin"),
-		WhisperThreads:  whisperThreads,
-		PiperBin:        getenv("PIPER_BIN", "/app/piper"),
-		PiperModel:      getenv("PIPER_MODEL", "/models/piper/en_US-ryan-high.onnx"),
-		EspeakData:      getenv("ESPEAK_DATA", "/opt/espeak-ng-data"),
-		LLMEndpoint:     strings.TrimRight(getenv("LLM_ENDPOINT", "http://127.0.0.1:8080"), "/"),
-		LLMModel:        getenv("LLM_MODEL", ""),
-		LLMSystemPrompt: getenv("LLM_SYSTEM_PROMPT", "You are a voice assistant. Reply in one or two short sentences."),
-		LLMTimeout:      llmTimeout,
-		CaptureSeconds:  captureSeconds,
-		Debug:           os.Getenv("DEBUG") == "true",
+		WhisperBin:          getenv("WHISPER_BIN", "/app/whisper-cli"),
+		WhisperModel:        getenv("WHISPER_MODEL", "/models/whisper/ggml-small.en-q5_1.bin"),
+		WhisperThreads:      whisperThreads,
+		PiperBin:            getenv("PIPER_BIN", "/app/piper"),
+		PiperModel:          getenv("PIPER_MODEL", "/models/piper/en_US-ryan-high.onnx"),
+		EspeakData:          getenv("ESPEAK_DATA", "/opt/espeak-ng-data"),
+		LLMEndpoint:         strings.TrimRight(getenv("LLM_ENDPOINT", "http://127.0.0.1:8080"), "/"),
+		LLMModel:            getenv("LLM_MODEL", ""),
+		LLMSystemPrompt:     getenv("LLM_SYSTEM_PROMPT", "You are a voice assistant. Reply in one or two short sentences."),
+		LLMTimeout:          llmTimeout,
+		LLMDisableReasoning: llmDisableReasoning,
+		LLMMaxTokens:        llmMaxTokens,
+		CaptureSeconds:      captureSeconds,
+		Debug:               os.Getenv("DEBUG") == "true",
 	}
 }
 
@@ -176,8 +194,13 @@ func callLLM(prompt string, config *Config) (string, error) {
 	req := LLMRequest{
 		Model:       config.LLMModel,
 		Messages:    messages,
-		MaxTokens:   100,
+		MaxTokens:   config.LLMMaxTokens,
 		Temperature: 0.7,
+	}
+	// llama.cpp has no "reasoning" request field; Qwen3-style chat
+	// templates disable thinking via the enable_thinking kwarg.
+	if config.LLMDisableReasoning {
+		req.ChatTemplateKwargs = map[string]bool{"enable_thinking": false}
 	}
 
 	jsonData, err := json.Marshal(req)
@@ -215,6 +238,10 @@ func callLLM(prompt string, config *Config) (string, error) {
 	}
 
 	content := llmResp.Choices[0].Message.Content
+	if strings.TrimSpace(content) == "" {
+		log.Printf("LLM returned empty content (finish_reason=%s, reasoning_content=%d chars); thinking may have consumed the token budget - raise LLM_MAX_TOKENS or keep reasoning disabled",
+			llmResp.Choices[0].FinishReason, len(llmResp.Choices[0].Message.ReasoningContent))
+	}
 	debugLog(fmt.Sprintf("LLM response: %s", content))
 
 	return content, nil
@@ -284,6 +311,9 @@ func main() {
 	log.Printf("LLM endpoint: %s", config.LLMEndpoint)
 	if config.LLMModel != "" {
 		log.Printf("LLM model: %s", config.LLMModel)
+	}
+	if config.LLMDisableReasoning {
+		log.Println("LLM thinking disabled (enable_thinking=false)")
 	}
 
 	fmt.Println("Voice Assistant ready! Press Ctrl+C to exit.")

@@ -67,6 +67,8 @@ Environment variables (all optional, see AGENTS.md for the full table):
 - `LLM_MODEL`: Model name sent with every request (required for llama.cpp router mode, e.g. `--models-dir`; default: empty)
 - `LLM_SYSTEM_PROMPT`: System prompt for chat completions (default: short voice-assistant prompt)
 - `LLM_TIMEOUT`: LLM request timeout (default: `30s`)
+- `LLM_DISABLE_REASONING`: Disable thinking/reasoning mode via `chat_template_kwargs` `{"enable_thinking": false}` (honored by Qwen3-style templates; a thinking model otherwise burns the whole token budget and returns an empty answer) (default: on; set `false` to allow reasoning)
+- `LLM_MAX_TOKENS`: Token budget per reply (default: `512`; lower, e.g. `100`, to cap latency once reasoning is disabled)
 - `CAPTURE_SECONDS`: Fixed capture window in seconds (default: `5`)
 - `DEBUG`: Enable debug logging (default: `false`)
 - `AUDIO_GID`: Host audio group GID for `/dev/snd` access as the non-root container user (default: `29`)

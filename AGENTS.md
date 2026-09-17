@@ -73,6 +73,8 @@ docker compose up -d
 | `LLM_MODEL` | _(unset)_ | Model name sent in every request; required for llama.cpp router mode (`--models-dir`/`--model-presets`), ignored by single-model servers |
 | `LLM_SYSTEM_PROMPT` | `You are a voice assistant. Reply in one or two short sentences.` | System prompt for chat completions |
 | `LLM_TIMEOUT` | `30s` | LLM request timeout (Go duration) |
+| `LLM_DISABLE_REASONING` | _(on)_ | Sends `chat_template_kwargs {"enable_thinking": false}` to disable thinking; honored by Qwen3-style chat templates. Set `false` to allow reasoning (then raise `LLM_MAX_TOKENS`) |
+| `LLM_MAX_TOKENS` | `512` | Reply token budget; a thinking model needs ~400+ (reasoning + answer), lower (e.g. 100) to cap latency once reasoning is off |
 | `CAPTURE_SECONDS` | `5` | Fixed audio capture window in seconds |
 | `WHISPER_BIN` | `/app/whisper-cli` | whisper-cli binary path |
 | `PIPER_BIN` | `/app/piper` | piper binary path |
@@ -168,6 +170,13 @@ voice-assistant/
 - Sends `LLM_MODEL` in the request body: required when the llama.cpp
   server runs in router mode (`--models-dir`/`--model-presets`), which
   rejects requests without a model name; single-model servers ignore it
+- Sends `chat_template_kwargs {"enable_thinking": false}` when
+  `LLM_DISABLE_REASONING` is on (default): llama.cpp has no per-request
+  "reasoning" switch (a `reasoning` field is silently ignored), and
+  Qwen3-style templates honor this kwarg. A thinking model otherwise
+  exhausts `LLM_MAX_TOKENS` on `reasoning_content` and returns an empty
+  `content` (perceived as silence); the orchestrator logs `finish_reason`
+  and reasoning length when that happens
 - Sends TTS text to piper via **stdin** (piper has no `--input-text` flag)
 - Plays audio via `aplay`
 - Measures and reports total latency including the capture window
@@ -204,7 +213,8 @@ voice-assistant/
   typical host user so the `./models` bind mount stays readable); the host
   audio group is added via `group_add: ${AUDIO_GID:-29}` for `/dev/snd`
   access, and model installs use `--user 0` (see Build Instructions)
-- `LLM_ENDPOINT`, `LLM_MODEL` and `LLM_SYSTEM_PROMPT` are passed through
+- `LLM_ENDPOINT`, `LLM_MODEL`, `LLM_SYSTEM_PROMPT`, `LLM_DISABLE_REASONING`
+  and `LLM_MAX_TOKENS` are passed through
   in docker-compose.yml (e.g. `${LLM_ENDPOINT:-http://host.docker.internal:8080}`),
   so they can be overridden via host env vars or a `.env` file (see
   `.env.example`)
