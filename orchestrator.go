@@ -1,20 +1,25 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 type ChatMessage struct {
@@ -27,6 +32,7 @@ type LLMRequest struct {
 	Messages           []ChatMessage   `json:"messages"`
 	MaxTokens          int             `json:"max_tokens"`
 	Temperature        float64         `json:"temperature"`
+	Stream             bool            `json:"stream,omitempty"`
 	ChatTemplateKwargs map[string]bool `json:"chat_template_kwargs,omitempty"`
 }
 
@@ -138,6 +144,7 @@ type Config struct {
 	LLMTimeout          time.Duration
 	LLMDisableReasoning bool
 	LLMMaxTokens        int
+	LLMStream           bool    // sentence-chunked streaming TTS via SSE
 	CaptureMode         string  // "vad" (silence-triggered) or "fixed" (fixed window)
 	CaptureSeconds      int     // fixed mode: window length in seconds
 	VadThreshold        float64 // sox amplitude threshold in percent
@@ -238,6 +245,7 @@ func loadConfig() *Config {
 		LLMTimeout:          llmTimeout,
 		LLMDisableReasoning: llmDisableReasoning,
 		LLMMaxTokens:        llmMaxTokens,
+		LLMStream:           getenv("LLM_STREAM", "false") == "true",
 		CaptureMode:         captureMode,
 		CaptureSeconds:      captureSeconds,
 		VadThreshold:        vadThreshold,
@@ -303,7 +311,6 @@ func captureAudio(config *Config) ([]byte, error) {
 	}
 
 	cmd := exec.Command("sox", args...)
-
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("failed to capture audio: %w, output: %s", err, string(output))
@@ -315,7 +322,6 @@ func captureAudio(config *Config) ([]byte, error) {
 	}
 
 	debugLog(config, fmt.Sprintf("Captured %d bytes of audio", len(wavData)))
-
 	return wavData, nil
 }
 
@@ -420,11 +426,13 @@ func sttWithWhisper(wavData []byte, config *Config) (string, error) {
 
 	text := strings.TrimSpace(string(raw))
 	debugLog(config, fmt.Sprintf("STT result: %s", text))
-
 	return text, nil
 }
 
-func buildLLMRequest(prompt string, config *Config, session *Session) (*bytes.Buffer, error) {
+// buildLLMRequest assembles the chat-completions request body: system
+// prompt + trimmed history + the current utterance. stream asks
+// llama.cpp for an SSE response (used by the sentence-chunked TTS path).
+func buildLLMRequest(prompt string, config *Config, session *Session, stream bool) (*bytes.Buffer, error) {
 	// System prompt + trimmed history + the current utterance.
 	messages := make([]ChatMessage, 0, len(session.messages)+2)
 	if config.LLMSystemPrompt != "" {
@@ -440,6 +448,7 @@ func buildLLMRequest(prompt string, config *Config, session *Session) (*bytes.Bu
 		Messages:    messages,
 		MaxTokens:   config.LLMMaxTokens,
 		Temperature: 0.7,
+		Stream:      stream,
 	}
 	if config.LLMDisableReasoning {
 		req.ChatTemplateKwargs = map[string]bool{"enable_thinking": false}
@@ -453,7 +462,7 @@ func buildLLMRequest(prompt string, config *Config, session *Session) (*bytes.Bu
 }
 
 func callLLM(prompt string, config *Config, session *Session) (string, error) {
-	reqBody, err := buildLLMRequest(prompt, config, session)
+	reqBody, err := buildLLMRequest(prompt, config, session, false)
 	if err != nil {
 		return "", err
 	}
@@ -505,10 +514,297 @@ func parseLLMResponse(body []byte) (string, error) {
 	return content, nil
 }
 
+// piperOutDir is the directory the persistent piper process writes its
+// per-sentence WAVs into (--output-dir). /tmp is writable by the
+// non-root container user.
+const piperOutDir = "/tmp/piper-tts"
+
+// piperSynthTimeout bounds one synthesis round trip (text line written,
+// WAV path ack received, file read). A var so tests can shorten it.
+var piperSynthTimeout = 30 * time.Second
+
+// errPiperDown marks failures that mean the piper process is unusable
+// (it exited, its pipes broke, or it stopped answering). synthesize
+// restarts the process and retries once for these; other errors (e.g. a
+// WAV that failed validation) leave a healthy process alone.
+var errPiperDown = errors.New("piper process is down")
+
+// cappedBuffer keeps only the last limit bytes written to it. piper's
+// stderr is captured into one so a chatty or crashing process cannot
+// grow an unbounded buffer; the tail is attached to error messages.
+type cappedBuffer struct {
+	mu    sync.Mutex
+	buf   []byte
+	limit int
+}
+
+func newCappedBuffer(limit int) *cappedBuffer {
+	return &cappedBuffer{limit: limit}
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.buf = append(c.buf, p...)
+	if len(c.buf) > c.limit {
+		c.buf = c.buf[len(c.buf)-c.limit:]
+	}
+	return len(p), nil
+}
+
+func (c *cappedBuffer) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return string(c.buf)
+}
+
+// piperProc is one running piper process with its request/ack plumbing.
+type piperProc struct {
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stderr *cappedBuffer
+	ack    chan string   // valid WAV paths printed by piper
+	dead   chan struct{} // closed once the process is reaped
+	done   chan struct{} // closed to abandon the process
+}
+
+// piperClient keeps a single piper process alive for the whole run.
+//
+// piper1-gpl's CLI (v1.8.0) synthesizes stdin line by line when given
+// --output-dir: the voice model is loaded once at startup, each input
+// line becomes a timestamped WAV in the directory, and the finished
+// file's path is printed to stdout (libpiper/src/main/utils/process.cpp,
+// OUTPUT_DIRECTORY branch). That is a ready-made request/ack protocol
+// with no piper source changes: write one sentence per line, read the
+// ack path, read the WAV. The model-load cost is paid once at startup
+// instead of once per utterance, which is what makes TTS fast.
+//
+// Empty input lines are skipped by piper without printing an ack, so
+// synthesize must never send them (it would hang the protocol). Acks
+// are flushed promptly: C++ ties cin to cout, so piper's getline flushes
+// the path before blocking on the next line, and the process is also
+// run under `stdbuf -oL` as belt and braces. Anything piper prints to
+// stdout that is not a WAV path under our output dir is skipped by the
+// reader, so stray log lines cannot desync the protocol.
+type piperClient struct {
+	bin    string
+	model  string
+	espeak string
+	dir    string
+	debug  bool
+
+	mu   sync.Mutex
+	proc *piperProc
+}
+
+// newPiperClient starts the persistent piper process. The caller should
+// validate it with a short warm-up synthesis and fall back to per-call
+// mode (ttsWithPiper) if that fails.
+func newPiperClient(bin, model, espeak, dir string, debug bool) (*piperClient, error) {
+	dir = filepath.Clean(dir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("failed to create piper output dir: %w", err)
+	}
+
+	pc := &piperClient{
+		bin:    bin,
+		model:  model,
+		espeak: espeak,
+		dir:    dir,
+		debug:  debug,
+	}
+	if err := pc.spawn(); err != nil {
+		return nil, err
+	}
+	log.Println("piper started (persistent TTS process, voice model loaded once)")
+	return pc, nil
+}
+
+func (pc *piperClient) debugf(format string, args ...any) {
+	if pc.debug {
+		log.Printf("[DEBUG] piper: "+format, args...)
+	}
+}
+
+// spawn starts a fresh piper process and its stdout reader goroutine.
+// Called by newPiperClient and by synthesize's restart path; always
+// with pc.mu held.
+func (pc *piperClient) spawn() error {
+	args := []string{"--model", pc.model}
+	if pc.espeak != "" {
+		args = append(args, "--espeak-data", pc.espeak)
+	}
+	args = append(args, "--output-dir", pc.dir)
+
+	// stdbuf -oL forces line-buffered stdout so the ack path is flushed
+	// as soon as it is written (coreutils; skipped if absent - the
+	// cin/cout tie already flushes before each blocking read).
+	argv := append([]string{pc.bin}, args...)
+	if _, err := exec.LookPath("stdbuf"); err == nil {
+		argv = append([]string{"stdbuf", "-oL"}, argv...)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create piper stdin pipe: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create piper stdout pipe: %w", err)
+	}
+	stderr := newCappedBuffer(4096)
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start piper: %w", err)
+	}
+
+	p := &piperProc{
+		cmd:    cmd,
+		stdin:  stdin,
+		stderr: stderr,
+		ack:    make(chan string, 8),
+		dead:   make(chan struct{}),
+		done:   make(chan struct{}),
+	}
+
+	go func() {
+		sc := bufio.NewScanner(stdout)
+	readLoop:
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if !isAckPath(line, pc.dir) {
+				pc.debugf("ignoring piper stdout line: %q", line)
+				continue
+			}
+			select {
+			case p.ack <- line:
+			case <-p.done:
+				break readLoop
+			}
+		}
+		// Reap the process (exited or killed) and announce the death.
+		_ = cmd.Wait()
+		close(p.dead)
+	}()
+
+	pc.proc = p
+	return nil
+}
+
+// isAckPath reports whether line is a WAV path piper printed under the
+// output directory - its per-line completion ack.
+func isAckPath(line, dir string) bool {
+	if !strings.HasPrefix(line, dir+string(filepath.Separator)) {
+		return false
+	}
+	if !strings.HasSuffix(line, ".wav") {
+		return false
+	}
+	return !strings.Contains(line, "..")
+}
+
+// synthesize speaks one chunk of text through the persistent piper
+// process and returns its WAV bytes. Failures marked errPiperDown
+// trigger a single restart + retry; other errors are returned as-is.
+func (pc *piperClient) synthesize(text string) ([]byte, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil, fmt.Errorf("piper synthesize: empty text")
+	}
+
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	data, err := pc.trySynth(text)
+	if err == nil || !errors.Is(err, errPiperDown) {
+		return data, err
+	}
+
+	// Process-level failure: restart once and retry the text.
+	pc.debugf("restarting piper after: %v", err)
+	pc.shutdown()
+	if serr := pc.spawn(); serr != nil {
+		return nil, fmt.Errorf("piper restart failed: %w", serr)
+	}
+	return pc.trySynth(text)
+}
+
+// trySynth runs one request/ack round against the current process.
+// Called with pc.mu held.
+func (pc *piperClient) trySynth(text string) ([]byte, error) {
+	p := pc.proc
+	if p == nil {
+		return nil, errPiperDown
+	}
+	if _, err := io.WriteString(p.stdin, text+"\n"); err != nil {
+		return nil, fmt.Errorf("%w: stdin write failed: %v", errPiperDown, err)
+	}
+	select {
+	case path, ok := <-p.ack:
+		if !ok {
+			return nil, fmt.Errorf("%w: ack channel closed", errPiperDown)
+		}
+		data, err := readAckWav(path)
+		if err != nil {
+			return nil, err
+		}
+		pc.debugf("generated %d bytes for %q", len(data), text)
+		return data, nil
+	case <-time.After(piperSynthTimeout):
+		return nil, fmt.Errorf("%w: no ack within %v", errPiperDown, piperSynthTimeout)
+	case <-p.dead:
+		return nil, fmt.Errorf("%w: process exited (last stderr: %s)", errPiperDown, p.stderr.String())
+	}
+}
+
+// readAckWav reads and removes one synthesized WAV, validating that it
+// is a complete RIFF file: a synthesis that produced no samples (e.g.
+// text with no speakable content) writes an empty file.
+func readAckWav(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	os.Remove(path)
+	if err != nil {
+		return nil, fmt.Errorf("piper output read failed: %w", err)
+	}
+	if _, err := wavDataSize(data); err != nil {
+		return nil, fmt.Errorf("piper produced no audio (%s): %w", path, err)
+	}
+	return data, nil
+}
+
+// shutdown abandons and kills the current process. done is closed first
+// so a reader blocked on a full ack channel wakes up; the kill turns a
+// blocked stdin read into EOF so the reader reaps the process and
+// closes dead. Called with pc.mu held.
+func (pc *piperClient) shutdown() {
+	p := pc.proc
+	if p == nil {
+		return
+	}
+	close(p.done)
+	_ = p.cmd.Process.Kill()
+	select {
+	case <-p.dead:
+	case <-time.After(5 * time.Second):
+		log.Println("piper process did not exit after kill")
+	}
+	pc.proc = nil
+}
+
+// stop shuts the persistent process down. main never calls it (the
+// loop runs until the orchestrator exits), but tests and local runs do.
+func (pc *piperClient) stop() {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	pc.shutdown()
+}
+
 func ttsWithPiper(text string, config *Config) ([]byte, error) {
-	// piper reads the text to synthesize from stdin and writes a WAV
-	// file at the voice's native sample rate (no --input-text/--sample-rate
-	// options exist in the piper CLI).
+	// Fallback when the persistent process cannot start: piper reads
+	// the text to synthesize from stdin and writes a WAV file at the
+	// voice's native sample rate (no --input-text/--sample-rate options
+	// exist in the piper CLI). The voice model is loaded per call.
 	tmpFile := fmt.Sprintf("/tmp/%d.wav", time.Now().UnixNano())
 	defer os.Remove(tmpFile)
 
@@ -534,7 +830,6 @@ func ttsWithPiper(text string, config *Config) ([]byte, error) {
 	}
 
 	debugLog(config, fmt.Sprintf("Generated %d bytes of audio", len(audioData)))
-
 	return audioData, nil
 }
 
@@ -555,6 +850,277 @@ func playAudio(audioData []byte) error {
 	}
 
 	return nil
+}
+
+// speaker pipelines TTS behind playback for one assistant response. A
+// TTS worker synthesizes sentences in order while a single player
+// goroutine plays them one at a time: synthesis of the next sentence
+// overlaps playback of the current one, two aplay processes never fight
+// over the ALSA device, and both channels being FIFO keeps the audio in
+// text order.
+type speaker struct {
+	synth func(string) ([]byte, error)
+	texts chan string
+	wavs  chan []byte
+	wg    sync.WaitGroup
+	spoke sync.Once
+}
+
+// newSpeaker starts the pipeline. synth is piperClient.synthesize for
+// the persistent process or a ttsWithPiper wrapper for the fallback.
+func newSpeaker(synth func(string) ([]byte, error)) *speaker {
+	s := &speaker{
+		synth: synth,
+		texts: make(chan string, 8),
+		wavs:  make(chan []byte, 2),
+	}
+	// TTS worker: sentences in, WAVs out.
+	go func() {
+		defer close(s.wavs)
+		for text := range s.texts {
+			data, err := s.synth(text)
+			if err != nil {
+				// One failed sentence is skipped, not fatal: the rest
+				// of the response still speaks.
+				log.Printf("TTS failed: %v", err)
+				continue
+			}
+			s.wavs <- data
+		}
+	}()
+	// Player: one aplay at a time, in order.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		for data := range s.wavs {
+			if err := playAudio(data); err != nil {
+				log.Printf("Failed to play audio: %v", err)
+			}
+		}
+	}()
+	return s
+}
+
+// submit queues one chunk of text for synthesis and playback. It blocks
+// once the pipeline is a whole response ahead of the speaker, which is
+// the backpressure that keeps the LLM stream from outrunning playback.
+func (s *speaker) submit(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	// Skip chunks with nothing speakable ("...", "???"): piper would
+	// produce an empty WAV for them.
+	if !strings.ContainsFunc(text, func(r rune) bool {
+		return unicode.IsLetter(r) || unicode.IsDigit(r)
+	}) {
+		return
+	}
+	s.spoke.Do(func() { fmt.Println("Speaking...") })
+	s.texts <- text
+}
+
+// closeAndWait drains the pipeline: no more text will be submitted, and
+// playback of everything already queued finishes before it returns.
+func (s *speaker) closeAndWait() {
+	close(s.texts)
+	s.wg.Wait()
+}
+
+// speakResponse synthesizes and plays a complete response through the
+// pipeline (the non-streaming path).
+func speakResponse(text string, synth func(string) ([]byte, error)) {
+	s := newSpeaker(synth)
+	s.submit(cleanForTTS(text))
+	s.closeAndWait()
+}
+
+// mdLeadRe matches leading markdown headings, block quotes and list
+// bullets at the start of a (single-line) sentence.
+var mdLeadRe = regexp.MustCompile(`^(?:[#>*-]+\s+)+`)
+
+// cleanForTTS strips markdown decoration the TTS would otherwise read
+// aloud ("**bold**", "`code`", "# heading", "- bullet").
+func cleanForTTS(text string) string {
+	text = strings.ReplaceAll(text, "**", "")
+	text = strings.ReplaceAll(text, "*", "")
+	text = strings.ReplaceAll(text, "`", "")
+	text = mdLeadRe.ReplaceAllString(strings.TrimSpace(text), "")
+	return strings.TrimSpace(text)
+}
+
+// sentenceAbbrevs lists words whose trailing period does not end a
+// sentence ("Mr. Smith arrived."). Matched case-insensitively on the
+// word stripped of its punctuation.
+var sentenceAbbrevs = map[string]bool{
+	"mr": true, "mrs": true, "ms": true, "dr": true,
+	"prof": true, "sr": true, "jr": true,
+	"st": true, "ave": true, "blvd": true,
+	"jan": true, "feb": true, "mar": true, "apr": true,
+	"may": true, "jun": true, "jul": true,
+	"aug": true, "sep": true, "sept": true, "oct": true,
+	"nov": true, "dec": true,
+	"eg": true, "ie": true, "vs": true, "etc": true,
+	"vol": true, "no": true, "fig": true,
+}
+
+// extractSentences splits buffered text into completed sentences plus
+// the unspoken remainder. A sentence ends at a run of '.', '!' or '?'
+// (optionally followed by closing quotes) that is itself followed by
+// whitespace, or at a newline; a period directly followed by another
+// character does not end a sentence (decimals like 3.5, URLs, "Mr."),
+// and an ellipsis (three or more dots) is a pause, not a sentence end.
+// A punctuation run at the very end of the buffer is left in the
+// remainder because more text may still arrive ("3." could become
+// "3.5"); the caller flushes the remainder when the response ends.
+func extractSentences(buf string) (sentences []string, remainder string) {
+	start, i := 0, 0
+	for i < len(buf) {
+		r, size := utf8.DecodeRuneInString(buf[i:])
+		switch {
+		case r == '\n':
+			// Paragraph break ends the sentence even without punctuation.
+			if s := strings.TrimSpace(buf[start:i]); s != "" {
+				sentences = append(sentences, s)
+			}
+			i += size
+			start = i
+		case r == '.' || r == '!' || r == '?':
+			// Extend over a punctuation run and any closing quotes.
+			j := i + size
+			for j < len(buf) && strings.IndexByte(".!?\"'", buf[j]) >= 0 {
+				j++
+			}
+			if j >= len(buf) {
+				// Could continue ("3." -> "3.5"): keep for later.
+				return sentences, strings.TrimLeft(buf[start:], " \t\v\f\r\n")
+			}
+			if next, _ := utf8.DecodeRuneInString(buf[j:]); unicode.IsSpace(next) {
+				// An ellipsis ("Well... okay.") is a pause inside the
+				// sentence, not its end.
+				ellipsis := strings.Count(buf[i:j], ".") >= 3
+				if !ellipsis && !endsAbbreviation(buf[start:j]) {
+					if s := strings.TrimSpace(buf[start:j]); s != "" {
+						sentences = append(sentences, s)
+					}
+					start = j
+				}
+			}
+			i = j
+		default:
+			i += size
+		}
+	}
+	return sentences, strings.TrimLeft(buf[start:], " \t\v\f\r\n")
+}
+
+// endsAbbreviation reports whether the word ending at the punctuation
+// run is a known abbreviation, so "Mr." must not become a sentence.
+func endsAbbreviation(text string) bool {
+	end := len(text)
+	for end > 0 && !unicode.IsSpace(rune(text[end-1])) {
+		end--
+	}
+	word := strings.ToLower(strings.Trim(text[end:], ".,!?\"'"))
+	return word != "" && sentenceAbbrevs[word]
+}
+
+// callLLMStream requests an SSE stream from llama.cpp and speaks the
+// response sentence by sentence while the rest is still generating:
+// each completed sentence is submitted to the speaker as soon as it
+// arrives, so its synthesis overlaps generation of the rest. It returns
+// only after playback of the whole response has finished, so the caller
+// never starts capturing while the assistant is still speaking (the
+// mic would pick up the assistant's own voice).
+func callLLMStream(prompt string, config *Config, session *Session, piper *piperClient) (string, error) {
+	reqBody, err := buildLLMRequest(prompt, config, session, true)
+	if err != nil {
+		return "", err
+	}
+
+	// The timeout is an overall deadline: http.Client.Timeout covers
+	// headers through the last SSE event, so it bounds total generation
+	// time for the stream.
+	client := &http.Client{Timeout: config.LLMTimeout}
+	resp, err := client.Post(
+		config.LLMEndpoint+"/v1/chat/completions",
+		"application/json",
+		reqBody,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to call LLM: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("LLM returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	sp := newSpeaker(piper.synthesize)
+	var full strings.Builder
+	var partial string
+	reader := bufio.NewReader(resp.Body)
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			// A broken stream after audio has already been spoken:
+			// keep what was generated so the recorded turn matches the
+			// audio, and let the flush below speak the remainder.
+			if full.Len() > 0 {
+				log.Printf("SSE stream failed mid-response (%v); continuing with partial text", err)
+				break
+			}
+			sp.closeAndWait()
+			return "", fmt.Errorf("failed to read SSE: %w", err)
+		}
+
+		// Each SSE event is one "data: {...}" line; llama.cpp ends the
+		// stream with "data: [DONE]".
+		if line = strings.TrimRight(line, "\r\n"); strings.HasPrefix(line, "data: ") {
+			dataStr := strings.TrimPrefix(line, "data: ")
+			if dataStr == "[DONE]" {
+				break
+			}
+			var chunk struct {
+				Choices []struct {
+					Delta struct {
+						Content string `json:"content"`
+					} `json:"delta"`
+					FinishReason string `json:"finish_reason"`
+				} `json:"choices"`
+			}
+			if json.Unmarshal([]byte(dataStr), &chunk) == nil && len(chunk.Choices) > 0 {
+				if content := chunk.Choices[0].Delta.Content; content != "" {
+					full.WriteString(content)
+					partial += content
+					var sentences []string
+					sentences, partial = extractSentences(partial)
+					for _, s := range sentences {
+						sp.submit(cleanForTTS(s))
+					}
+				}
+				if chunk.Choices[0].FinishReason != "" {
+					break
+				}
+			}
+		}
+
+		if err == io.EOF {
+			break
+		}
+	}
+
+	// Flush whatever never reached a sentence boundary.
+	if rest := cleanForTTS(partial); rest != "" {
+		sp.submit(rest)
+	}
+	sp.closeAndWait()
+
+	content := strings.TrimSpace(full.String())
+	debugLog(config, fmt.Sprintf("LLM streaming response: %s", content))
+	return content, nil
 }
 
 func main() {
@@ -580,6 +1146,9 @@ func main() {
 	if config.LLMDisableReasoning {
 		log.Println("LLM thinking disabled (enable_thinking=false)")
 	}
+	if config.LLMStream {
+		log.Println("LLM streaming enabled (sentence-chunked TTS)")
+	}
 	if config.CaptureMode == "vad" {
 		log.Printf("Capture: voice-activated (threshold %g%%, stop after %ss of silence, max utterance %ds)",
 			config.VadThreshold, soxDuration(config.VadSilenceSec), config.VadMaxUtteranceSec)
@@ -597,6 +1166,29 @@ func main() {
 	}
 	fmt.Printf("Voice Assistant ready! Say '%s' to reset the conversation.\n", config.SessionResetPhrase)
 	fmt.Println()
+
+	// Start the persistent piper process (voice model loaded once for
+	// the whole run) and validate it with a short warm-up synthesis,
+	// which also pre-warms the model. On failure, fall back to
+	// spawning piper per utterance (ttsWithPiper).
+	piper, err := newPiperClient(config.PiperBin, config.PiperModel, config.EspeakData, piperOutDir, config.Debug)
+	if err != nil {
+		log.Printf("Failed to start persistent piper (%v); falling back to per-call mode", err)
+		piper = nil
+	} else if _, err := piper.synthesize("Voice assistant ready."); err != nil {
+		log.Printf("Persistent piper failed validation (%v); falling back to per-call mode", err)
+		piper.stop()
+		piper = nil
+	}
+
+	// All speech goes through the same pipeline; only the synthesis
+	// function differs between persistent and per-call piper.
+	synthesize := func(text string) ([]byte, error) {
+		return ttsWithPiper(text, config)
+	}
+	if piper != nil {
+		synthesize = piper.synthesize
+	}
 
 	for {
 		if config.CaptureMode == "vad" {
@@ -663,25 +1255,23 @@ func main() {
 			log.Println("Session reset by user")
 			response := "Session reset."
 			fmt.Printf("Assistant: %s\n", response)
-
-			audioData, err := ttsWithPiper(response, config)
-			if err != nil {
-				log.Printf("TTS failed: %v", err)
-			} else {
-				fmt.Println("Speaking...")
-				err = playAudio(audioData)
-				if err != nil {
-					log.Printf("Failed to play audio: %v", err)
-				}
-			}
+			speakResponse(response, synthesize)
 			continue
 		}
 
 		session.lastSpeech = time.Now()
 
-		// callLLM appends the current utterance to the request itself;
-		// the turn is recorded in the history only after a reply.
-		response, err := callLLM(text, config, session)
+		// With streaming enabled, callLLMStream speaks the response
+		// sentence by sentence and returns only after playback has
+		// finished. Otherwise the full reply is spoken below. Either
+		// way the capture loop resumes only once the assistant has
+		// gone quiet.
+		var response string
+		if config.LLMStream && piper != nil {
+			response, err = callLLMStream(text, config, session, piper)
+		} else {
+			response, err = callLLM(text, config, session)
+		}
 		if err != nil {
 			log.Printf("LLM failed: %v", err)
 			continue
@@ -694,19 +1284,14 @@ func main() {
 			continue
 		}
 
+		// callLLM appends the current utterance to the request itself;
+		// the turn is recorded in the history only after a reply.
 		session.appendTurn(text, response)
 
-		audioData, err := ttsWithPiper(response, config)
-		if err != nil {
-			log.Printf("TTS failed: %v", err)
-			continue
-		}
-
-		fmt.Println("Speaking...")
-		err = playAudio(audioData)
-		if err != nil {
-			log.Printf("Failed to play audio: %v", err)
-			continue
+		// For non-streaming mode, the whole reply is one submission to
+		// the same pipeline (streaming already spoke it above).
+		if !config.LLMStream || piper == nil {
+			speakResponse(response, synthesize)
 		}
 
 		totalTime := time.Since(startTime)
@@ -715,9 +1300,7 @@ func main() {
 			(totalTime - captureTime).Round(time.Millisecond),
 			totalTime.Round(time.Millisecond))
 		fmt.Println()
-
-		if config.Debug {
-			fmt.Printf("Debug: Audio bytes: %d\n", len(audioData))
-		}
 	}
+	// piper.stop() is never reached (infinite loop); the process ends
+	// when the orchestrator exits.
 }

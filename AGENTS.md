@@ -45,11 +45,14 @@ dropped before whisper_full) → transcript file (<base>.txt via -of/-otxt)
     ↓
 HTTP POST to llama.cpp host.docker.internal:8080/v1/chat/completions
     ↓
-Response text
+Response text (with LLM_STREAM=true: SSE stream, consumed sentence by
+sentence as it generates)
     ↓
-piper CLI (text via stdin) → WAV at the voice's native sample rate
+piper CLI (persistent process; one sentence per stdin line, WAV per
+line via --output-dir) → WAV at the voice's native sample rate
     ↓
-aplay → Host Speaker
+aplay → Host Speaker (single ordered player; capture resumes only after
+playback drains, so the mic never hears the assistant)
 ```
 
 ## Build Instructions
@@ -79,9 +82,10 @@ docker compose up -d
 | `LLM_ENDPOINT` | `http://host.docker.internal:8080` | LLM API endpoint (bridge network, host-gateway alias); overridable via host env var or `.env` file |
 | `LLM_MODEL` | _(unset)_ | Model name sent in every request; required for llama.cpp router mode (`--models-dir`/`--model-presets`), ignored by single-model servers |
 | `LLM_SYSTEM_PROMPT` | `You are a voice assistant. Reply in one or two short sentences.` | System prompt for chat completions |
-| `LLM_TIMEOUT` | `30s` | LLM request timeout (Go duration) |
+| `LLM_TIMEOUT` | `30s` | LLM request timeout in Go duration syntax; with `LLM_STREAM` it covers headers through the last SSE event. Overridable via host env var or `.env` file |
 | `LLM_DISABLE_REASONING` | _(on)_ | Sends `chat_template_kwargs {"enable_thinking": false}` to disable thinking; honored by Qwen3-style chat templates. Set `false` to allow reasoning (then raise `LLM_MAX_TOKENS`) |
 | `LLM_MAX_TOKENS` | `512` | Reply token budget; a thinking model needs ~400+ (reasoning + answer), lower (e.g. 100) to cap latency once reasoning is off |
+| `LLM_STREAM` | `false` | Sentence-chunked streaming TTS: requests the reply as an SSE stream (`"stream": true`) and speaks each completed sentence while the rest is still generating; needs the persistent piper process (falls back to whole-reply TTS otherwise). Overridable via host env var or `.env` file |
 | `CAPTURE_MODE` | `vad` | `vad` = silence-triggered capture via the sox `silence` effect; `fixed` = fixed window via `CAPTURE_SECONDS` |
 | `CAPTURE_SECONDS` | `5` | Fixed audio capture window in seconds (used by `CAPTURE_MODE=fixed`) |
 | `VAD_THRESHOLD` | `10` | sox amplitude threshold (%) for speech start/stop; tune per mic/room (overridable via host env var or `.env`) |
@@ -125,10 +129,10 @@ docker compose run --rm voice-assistant aplay -l
 
 | Component | Target Latency | Notes |
 |-----------|----------------|-------|
-| **Total (end-to-end)** | utterance + 2s tail + 3-4s | Capture ends ~2s after speech stops (VAD_SILENCE_SEC) |
+| **Total (end-to-end)** | utterance + 2s tail + 3-4s | Capture ends ~2s after speech stops (VAD_SILENCE_SEC); with `LLM_STREAM=true` the *first sentence* is heard much sooner - roughly STT + LLM time-to-first-sentence + synthesis, while the rest is still generating |
 | Whisper STT | <1500ms | small.en-q5_1 model, Release build (4 threads by default; raise `WHISPER_THREADS` to cut this) |
 | LLM inference | <1500ms | via llama.cpp |
-| Piper TTS | <1000ms | ryan-high model, CLI mode, model loaded per call |
+| Piper TTS | <1000ms | ryan-high model; persistent process, voice model loaded once at startup (a per-sentence synthesis is synth-only, no model load). Fallback mode loads the model per call |
 | Audio capture | utterance + 2s tail | Voice-activated (sox `silence` effect, 30s cap); the wait for speech is free - sox blocks on the mic, no whisper inference is burned on silence |
 
 The orchestrator measures latency from the start of capture and reports
@@ -161,6 +165,7 @@ voice-assistant/
 ├── docker-compose.yml         # Docker Compose configuration
 ├── Dockerfile                 # Combined container build
 ├── orchestrator.go            # Go orchestrator code
+├── orchestrator_test.go       # Unit tests (sentence splitting, piper protocol via a fake CLI)
 ├── go.mod                     # Go module file
 ├── entrypoint.sh              # Container entrypoint script
 ├── install_models.sh          # Model download script
@@ -220,7 +225,24 @@ voice-assistant/
   exhausts `LLM_MAX_TOKENS` on `reasoning_content` and returns an empty
   `content` (perceived as silence); the orchestrator logs `finish_reason`
   and reasoning length when that happens
-- Sends TTS text to piper via **stdin** (piper has no `--input-text` flag)
+- Sends TTS text to piper via **stdin** (piper has no `--input-text`
+  flag). One persistent piper process serves the whole run (see Piper
+  Integration); if it fails to start or validate at startup, the
+  orchestrator falls back to spawning piper per utterance
+  (`ttsWithPiper`)
+- All speech goes through a per-response `speaker` pipeline: a TTS
+  worker synthesizes sentences in order while a single player goroutine
+  plays them one at a time (synthesis of sentence N+1 overlaps playback
+  of sentence N, exactly one `aplay` at a time, audio in text order)
+- With `LLM_STREAM=true`, requests `"stream": true` and consumes the
+  SSE stream sentence by sentence: completed sentences (`.`, `!`, `?`
+  followed by whitespace, guarded against abbreviations/decimals/
+  ellipses; newline also splits; markdown decoration stripped) are
+  spoken while the rest is still generating. A broken stream after
+  audio was already spoken keeps the partial text so the recorded turn
+  matches the audio
+- Playback always drains before the capture loop resumes (the speaker
+  is awaited), so the mic never records the assistant's own voice
 - Plays audio via `aplay`
 - Measures and reports total latency including the capture window
 
@@ -241,6 +263,20 @@ voice-assistant/
   prebuilt onnxruntime as a shared library
 - CLI mode only (no HTTP server): reads text from stdin, writes a WAV file
   at the voice's native sample rate (no `--sample-rate` flag exists)
+- **Persistent process** (the fast path): with `--output-dir`, the CLI's
+  stdin loop (libpiper `src/main/utils/process.cpp`, OUTPUT_DIRECTORY
+  branch) synthesizes each input line separately with the voice model
+  loaded once, writes a timestamped WAV per line, and prints the
+  finished file's path to stdout. The orchestrator runs one such process
+  for the whole run under `stdbuf -oL` and uses that as a request/ack
+  protocol: write one sentence per line, read the ack path, read and
+  delete the WAV. Empty lines get no ack (piper skips them), so they are
+  never sent; anything on stdout that is not a WAV path under the output
+  dir is ignored, so log noise cannot desync the protocol. A dead or
+  unresponsive process (30s no-ack) is restarted once per synthesis
+- Fallback (`ttsWithPiper`): one piper invocation per utterance with
+  `--output-file`, voice model loaded per call - used only when the
+  persistent process cannot start or validate at startup
 - Runtime needs `libpiper.so` + `libonnxruntime.so` (installed to
   `/usr/local/lib`, ldconfig) and espeak-ng data at `/opt/espeak-ng-data`
 
@@ -273,9 +309,9 @@ voice-assistant/
   `docker compose run --rm --user "$(id -u):$(id -g)" voice-assistant
   /app/install_models.sh`
 - `LLM_ENDPOINT`, `LLM_MODEL`, `LLM_SYSTEM_PROMPT`, `LLM_DISABLE_REASONING`,
-  `LLM_MAX_TOKENS`, `WHISPER_THREADS`, `WHISPER_VAD_MODEL`, the
-  `CAPTURE_MODE`/`VAD_*` capture variables and the `SESSION_*` session
-  variables are passed through in
+  `LLM_MAX_TOKENS`, `LLM_TIMEOUT`, `LLM_STREAM`, `WHISPER_THREADS`,
+  `WHISPER_VAD_MODEL`, the `CAPTURE_MODE`/`VAD_*` capture variables and
+  the `SESSION_*` session variables are passed through in
   docker-compose.yml (e.g. `${LLM_ENDPOINT:-http://host.docker.internal:8080}`),
   so they can be overridden via host env vars or a `.env` file (see
   `.env.example`)
@@ -336,6 +372,9 @@ sudo apt install sox libsox-fmt-alsa alsa-utils
 
 # Build orchestrator
 go build -o voice-assistant orchestrator.go
+
+# Run the unit tests (sentence splitting, piper request/ack protocol)
+go test ./...
 
 # Run with local paths/models
 WHISPER_BIN=/path/to/whisper-cli \
