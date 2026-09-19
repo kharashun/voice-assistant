@@ -40,7 +40,9 @@ Host (Ubuntu)
 # Build the image
 docker compose build
 
-# Download models (as root, since the script writes to the ./models volume)
+# Download models (as root, since the script writes to the ./models volume;
+# if ./models is owned by your user and this fails with Permission denied,
+# use --user "$(id -u):$(id -g)" instead - see "Model not found" below)
 docker compose run --rm --user 0 voice-assistant /app/install_models.sh
 
 # Start the assistant
@@ -169,6 +171,16 @@ Run the install script (as root, since it writes to the `./models` volume):
 ```bash
 docker compose run --rm --user 0 voice-assistant /app/install_models.sh
 ```
+
+The container drops all Linux capabilities (`cap_drop: ALL` in
+docker-compose.yml), so even the root install can only write where uid 0
+already owns the path. On a fresh host Docker creates `./models` root-owned
+and this just works; if you created `./models` yourself and the run fails
+with `Permission denied`, install as your own uid instead:
+```bash
+docker compose run --rm --user "$(id -u):$(id -g)" voice-assistant /app/install_models.sh
+```
+
 ### LLM connection failed
 
 Ensure llama.cpp is running on port 8080 and listening on all interfaces

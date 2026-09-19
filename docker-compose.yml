@@ -35,6 +35,8 @@ services:
       - DEBUG=false
     devices:
       - /dev/snd:/dev/snd
+    cap_drop:
+      - ALL
     # Host audio group (gid 29 on Ubuntu) so the non-root container user can
     # open the /dev/snd devices.
     group_add:

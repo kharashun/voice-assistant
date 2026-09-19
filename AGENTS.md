@@ -59,7 +59,10 @@ aplay → Host Speaker
 docker compose build
 
 # Download models (first time only; --user 0 because the script writes to
-# the ./models volume and the container otherwise runs non-root)
+# the ./models volume and the container otherwise runs non-root. With
+# cap_drop: ALL, container root has no capabilities either - if ./models is
+# owned by your host user and this fails with Permission denied, use
+# --user "$(id -u):$(id -g)" instead; see Docker Configuration below)
 docker compose run --rm --user 0 voice-assistant /app/install_models.sh
 
 # Start the service
@@ -257,6 +260,18 @@ voice-assistant/
   typical host user so the `./models` bind mount stays readable); the host
   audio group is added via `group_add: ${AUDIO_GID:-29}` for `/dev/snd`
   access, and model installs use `--user 0` (see Build Instructions)
+- `cap_drop: ALL`: the service needs zero Linux capabilities (audio access
+  is via the audio group on `/dev/snd`, all file writes go to `/tmp`, the
+  only networking is outbound HTTP), and the empty bounding set means the
+  image's setuid/file-capability binaries cannot restore privilege to a
+  compromised process. `docker compose run` inherits this, so `--user 0`
+  install runs have no `DAC_OVERRIDE`/`CHOWN`: container root can only
+  write where uid 0 already owns the path (fine on a fresh host, where
+  Docker auto-creates `./models` root-owned, and for re-downloads over
+  root-owned files). If `./models` is owned by the host user and the
+  install fails with Permission denied, run it as that uid instead:
+  `docker compose run --rm --user "$(id -u):$(id -g)" voice-assistant
+  /app/install_models.sh`
 - `LLM_ENDPOINT`, `LLM_MODEL`, `LLM_SYSTEM_PROMPT`, `LLM_DISABLE_REASONING`,
   `LLM_MAX_TOKENS`, `WHISPER_THREADS`, `WHISPER_VAD_MODEL`, the
   `CAPTURE_MODE`/`VAD_*` capture variables and the `SESSION_*` session
@@ -291,6 +306,11 @@ docker compose run --rm voice-assistant bash -c 'sox -d -r 16000 -c 1 -b 16 -t w
 ```bash
 # Re-download models
 docker compose run --rm --user 0 voice-assistant /app/install_models.sh
+
+# If ./models is owned by your host user, the --user 0 run cannot write
+# there (cap_drop: ALL strips DAC_OVERRIDE even from root) - install as
+# the owning uid instead:
+docker compose run --rm --user "$(id -u):$(id -g)" voice-assistant /app/install_models.sh
 ```
 
 ### LLM Connection
