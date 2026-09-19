@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -232,5 +233,97 @@ func TestBuildLLMRequestStream(t *testing.T) {
 	}
 	if !strings.Contains(body.String(), `"stream":true`) {
 		t.Error("streaming request must set stream:true")
+	}
+}
+
+func TestCaptureArgs(t *testing.T) {
+	base := []string{"-d", "-r", "16000", "-c", "1", "-b", "16", "-t", "wav", "/tmp/x.wav"}
+
+	cfg := &Config{CaptureMode: "vad", VadThreshold: 10, VadStartMs: 100, VadSilenceSec: 2, VadMaxUtteranceSec: 30}
+	if got := captureArgs(cfg, "/tmp/x.wav"); !reflect.DeepEqual(got, append(append([]string{}, base...),
+		"silence", "1", "0.1", "10%", "1", "2.0", "10%", "trim", "0", "30.0")) {
+		t.Errorf("symmetric vad args = %v", got)
+	}
+
+	cfg.VadStopThreshold = 30
+	if got := captureArgs(cfg, "/tmp/x.wav"); !reflect.DeepEqual(got, append(append([]string{}, base...),
+		"silence", "1", "0.1", "10%", "1", "2.0", "30%", "trim", "0", "30.0")) {
+		t.Errorf("asymmetric stop threshold args = %v", got)
+	}
+
+	cfg = &Config{CaptureMode: "fixed", CaptureSeconds: 5}
+	if got := captureArgs(cfg, "/tmp/x.wav"); !reflect.DeepEqual(got, append(append([]string{}, base...),
+		"trim", "0", "5.0")) {
+		t.Errorf("fixed window args = %v", got)
+	}
+}
+
+func TestSilenceWav(t *testing.T) {
+	for _, d := range []time.Duration{0, 500 * time.Millisecond, 1500 * time.Millisecond} {
+		wav := silenceWav(d)
+		size, err := wavDataSize(wav)
+		if err != nil {
+			t.Fatalf("silenceWav(%v): %v", d, err)
+		}
+		if want := uint32(int(d*16000/time.Second) * 2); size != want {
+			t.Errorf("silenceWav(%v) data size = %d, want %d", d, size, want)
+		}
+		for _, b := range wav[44:] {
+			if b != 0 {
+				t.Fatalf("silenceWav(%v) has non-zero sample data", d)
+			}
+		}
+	}
+}
+
+func TestTurnStats(t *testing.T) {
+	var nilStats *turnStats
+	nilStats.setSTT(time.Second)
+	nilStats.startLLM()
+	nilStats.firstToken()
+	nilStats.doneLLM()
+	nilStats.sawReasoning()
+	nilStats.noteSynth(time.Second)
+	nilStats.notePlaybackStart()
+	nilStats.addPlayback(time.Second)
+	if n := nilStats.reasoningCount(); n != 0 {
+		t.Errorf("nil stats reasoningCount = %d, want 0", n)
+	}
+
+	s := newTurnStats()
+	s.startLLM()
+	s.sawReasoning()
+	s.sawReasoning()
+	s.firstToken()
+	s.firstToken() // second call must not overwrite the first-token time
+	s.doneLLM()
+	s.setSTT(800 * time.Millisecond)
+	s.noteSynth(300 * time.Millisecond)
+	s.noteSynth(500 * time.Millisecond)
+	s.notePlaybackStart()
+	s.addPlayback(2 * time.Second)
+	if got := s.reasoningCount(); got != 2 {
+		t.Errorf("reasoningCount = %d, want 2", got)
+	}
+	if s.llmTotal == 0 || s.llmTTFT == 0 || s.llmTotal < s.llmTTFT {
+		t.Errorf("LLM timings inconsistent: ttft=%v total=%v", s.llmTTFT, s.llmTotal)
+	}
+	if s.ttsFirst != 300*time.Millisecond {
+		t.Errorf("ttsFirst = %v, want 300ms", s.ttsFirst)
+	}
+
+	line := s.summary(9 * time.Second, 12 * time.Second)
+	for _, want := range []string{
+		"Capture: 9s", "STT: 800ms", "LLM: first token", "total ",
+		"TTS: first 300ms", "2 sentences", "First audio:", "Playback: 2s", "Total: 12s",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("summary %q missing %q", line, want)
+		}
+	}
+
+	empty := newTurnStats().summary(time.Second, time.Second)
+	if strings.Contains(empty, "STT:") || strings.Contains(empty, "LLM:") || strings.Contains(empty, "Playback:") {
+		t.Errorf("empty summary should omit unmeasured stages, got %q", empty)
 	}
 }

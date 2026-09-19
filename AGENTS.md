@@ -88,9 +88,10 @@ docker compose up -d
 | `LLM_STREAM` | `false` | Sentence-chunked streaming TTS: requests the reply as an SSE stream (`"stream": true`) and speaks each completed sentence while the rest is still generating; needs the persistent piper process (falls back to whole-reply TTS otherwise). Overridable via host env var or `.env` file |
 | `CAPTURE_MODE` | `vad` | `vad` = silence-triggered capture via the sox `silence` effect; `fixed` = fixed window via `CAPTURE_SECONDS` |
 | `CAPTURE_SECONDS` | `5` | Fixed audio capture window in seconds (used by `CAPTURE_MODE=fixed`) |
-| `VAD_THRESHOLD` | `10` | sox amplitude threshold (%) for speech start/stop; tune per mic/room (overridable via host env var or `.env`) |
+| `VAD_THRESHOLD` | `10` | sox amplitude threshold (%) that starts the recording; tune per mic/room (overridable via host env var or `.env`) |
+| `VAD_STOP_THRESHOLD` | _(unset)_ | sox amplitude threshold (%) above which sound resets the end-of-speech counter; set above the room's noise peaks so fan/keyboard blips cannot hold the recording open. Unset = same as `VAD_THRESHOLD` (symmetric) |
 | `VAD_START_MS` | `100` | Sound duration (ms) above the threshold that starts the recording |
-| `VAD_SILENCE_SEC` | `2.0` | Quiet duration (s) below the threshold that ends the utterance |
+| `VAD_SILENCE_SEC` | `2.0` | Quiet duration (s) below the stop threshold that ends the utterance |
 | `VAD_MAX_UTTERANCE_SEC` | `30` | Hard cap on one utterance (sox `trim`), so constant noise cannot record forever |
 | `VAD_MIN_SPEECH_MS` | `500` | Captures shorter than this are skipped before STT (transient noise, not speech) |
 | `SESSION_TIMEOUT_SEC` | `60` | Seconds of silence before the conversation history auto-resets; checked when the next capture ends (sox blocks in vad mode, so a between-iteration check would never fire). `0` disables the timeout |
@@ -165,7 +166,7 @@ voice-assistant/
 ├── docker-compose.yml         # Docker Compose configuration
 ├── Dockerfile                 # Combined container build
 ├── orchestrator.go            # Go orchestrator code
-├── orchestrator_test.go       # Unit tests (sentence splitting, piper protocol via a fake CLI)
+├── orchestrator_test.go       # Unit tests (sentence splitting, piper protocol via a fake CLI, sox capture args, warm-up WAV, turn stats)
 ├── go.mod                     # Go module file
 ├── entrypoint.sh              # Container entrypoint script
 ├── install_models.sh          # Model download script
@@ -190,6 +191,21 @@ voice-assistant/
   `VAD_MAX_UTTERANCE_SEC` via sox `trim`; `CAPTURE_MODE=fixed` restores the
   old fixed window (`CAPTURE_SECONDS`). sox durations are formatted with a
   decimal point - bare integers are parsed as sample counts
+- The sox `silence` effect uses asymmetric thresholds
+  (`VAD_STOP_THRESHOLD`): the start threshold only needs one blip to begin
+  the recording, while only sound above the (higher) stop threshold resets
+  the end-of-speech counter - in a noisy room, amplitude blips below the
+  stop threshold let the recording end on time instead of stretching every
+  capture by seconds of "silence" the user waits through
+- Pre-warms both models at startup: piper with a validation synthesis and
+  whisper with a one-second silent WAV run through the same `sttWithWhisper`
+  path, so the model loads are not paid by the first response after a
+  (re)start
+- Reports per-stage latency after every turn (`turnStats`): STT, LLM
+  time-to-first-token and total, TTS first/total, playback, and "First
+  audio: X after capture end" - the latency the user actually perceives
+  (the old single "STT+LLM+TTS+playback" number buried it inside the
+  playback drain)
 - Skips STT entirely when a vad-mode capture is shorter than
   `VAD_MIN_SPEECH_MS` (transient noise started the recording, no speech
   followed)
@@ -224,7 +240,9 @@ voice-assistant/
   Qwen3-style templates honor this kwarg. A thinking model otherwise
   exhausts `LLM_MAX_TOKENS` on `reasoning_content` and returns an empty
   `content` (perceived as silence); the orchestrator logs `finish_reason`
-  and reasoning length when that happens
+  and reasoning length when that happens, and the streaming path counts
+  `reasoning_content` deltas and logs a warning (they are not spoken but
+  delay the first sentence)
 - Sends TTS text to piper via **stdin** (piper has no `--input-text`
   flag). One persistent piper process serves the whole run (see Piper
   Integration); if it fails to start or validate at startup, the
@@ -244,6 +262,9 @@ voice-assistant/
 - Playback always drains before the capture loop resumes (the speaker
   is awaited), so the mic never records the assistant's own voice
 - Plays audio via `aplay`
+- Handles SIGINT/SIGTERM: stops piper and exits 0 (without a handler
+  the Go process dies on the signal and the exit code looks like a
+  crash); sox/aplay children die with the container's PID namespace
 - Measures and reports total latency including the capture window
 
 ### Whisper Integration

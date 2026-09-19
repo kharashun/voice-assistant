@@ -12,11 +12,13 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -147,7 +149,8 @@ type Config struct {
 	LLMStream           bool    // sentence-chunked streaming TTS via SSE
 	CaptureMode         string  // "vad" (silence-triggered) or "fixed" (fixed window)
 	CaptureSeconds      int     // fixed mode: window length in seconds
-	VadThreshold        float64 // sox amplitude threshold in percent
+	VadThreshold        float64 // sox amplitude threshold (%) that starts the recording
+	VadStopThreshold    float64 // sox amplitude threshold (%) that counts as quiet when stopping; 0 = same as VadThreshold
 	VadStartMs          int     // sound duration that starts the recording
 	VadSilenceSec       float64 // quiet duration that ends the recording
 	VadMaxUtteranceSec  int     // hard cap on utterance length
@@ -200,6 +203,13 @@ func loadConfig() *Config {
 		vadThreshold = 10
 	}
 
+	// 0 (unset/invalid) = follow VAD_THRESHOLD, which keeps the old
+	// symmetric behavior.
+	vadStopThreshold, err := strconv.ParseFloat(getenv("VAD_STOP_THRESHOLD", ""), 64)
+	if err != nil || vadStopThreshold < 0 || vadStopThreshold > 100 {
+		vadStopThreshold = 0
+	}
+
 	vadStartMs, err := strconv.Atoi(getenv("VAD_START_MS", "100"))
 	if err != nil || vadStartMs <= 0 {
 		vadStartMs = 100
@@ -249,6 +259,7 @@ func loadConfig() *Config {
 		CaptureMode:         captureMode,
 		CaptureSeconds:      captureSeconds,
 		VadThreshold:        vadThreshold,
+		VadStopThreshold:    vadStopThreshold,
 		VadStartMs:          vadStartMs,
 		VadSilenceSec:       vadSilenceSec,
 		VadMaxUtteranceSec:  vadMaxUtteranceSec,
@@ -277,40 +288,49 @@ func soxDuration(seconds float64) string {
 	return s
 }
 
-func captureAudio(config *Config) ([]byte, error) {
-	// Use sox to capture from the ALSA default device directly as 16kHz WAV
-	tmpFile := fmt.Sprintf("/tmp/%d.wav", time.Now().UnixNano())
-	defer os.Remove(tmpFile)
-
+// captureArgs builds the sox argument list for one capture. In vad mode
+// the `silence` effect endpointing uses separate start and stop
+// thresholds: the start threshold only needs one 100ms blip of speech to
+// begin, while the stop threshold decides what counts as quiet
+// afterwards. In a noisy room they should be asymmetric (start low so
+// quiet speech still triggers, stop high so fan/keyboard blips do not
+// keep resetting the end-of-speech counter - every reset is a second the
+// user waits in silence). `trim` after `silence` caps the utterance
+// length so constant noise cannot record forever.
+func captureArgs(config *Config, outFile string) []string {
 	args := []string{
 		"-d",          // default audio device
 		"-r", "16000", // 16kHz sample rate
 		"-c", "1", // mono
 		"-b", "16", // 16-bit
 		"-t", "wav", // WAV format
-		tmpFile, // output file
+		outFile,
 	}
 	if config.CaptureMode == "vad" {
-		// Voice-activated capture via the sox `silence` effect:
-		// - discard audio until VadStartMs of sound above the threshold
-		//   starts the recording (the wait for speech is unbounded and
-		//   free - sox just blocks on the mic),
-		// - stop the recording after VadSilenceSec of quiet below it.
-		// `trim` after `silence` caps the utterance length so constant
-		// noise cannot keep the recording running forever.
-		threshold := fmt.Sprintf("%g%%", config.VadThreshold)
+		start := fmt.Sprintf("%g%%", config.VadThreshold)
+		stop := start
+		if config.VadStopThreshold > 0 {
+			stop = fmt.Sprintf("%g%%", config.VadStopThreshold)
+		}
 		args = append(args,
 			"silence",
-			"1", soxDuration(float64(config.VadStartMs)/1000), threshold,
-			"1", soxDuration(config.VadSilenceSec), threshold,
+			"1", soxDuration(float64(config.VadStartMs)/1000), start,
+			"1", soxDuration(config.VadSilenceSec), stop,
 			"trim", "0", soxDuration(float64(config.VadMaxUtteranceSec)),
 		)
 	} else {
 		// Fixed window: record a fixed number of seconds.
 		args = append(args, "trim", "0", soxDuration(float64(config.CaptureSeconds)))
 	}
+	return args
+}
 
-	cmd := exec.Command("sox", args...)
+func captureAudio(config *Config) ([]byte, error) {
+	// Use sox to capture from the ALSA default device directly as 16kHz WAV
+	tmpFile := fmt.Sprintf("/tmp/%d.wav", time.Now().UnixNano())
+	defer os.Remove(tmpFile)
+
+	cmd := exec.Command("sox", captureArgs(config, tmpFile)...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("failed to capture audio: %w, output: %s", err, string(output))
@@ -427,6 +447,39 @@ func sttWithWhisper(wavData []byte, config *Config) (string, error) {
 	text := strings.TrimSpace(string(raw))
 	debugLog(config, fmt.Sprintf("STT result: %s", text))
 	return text, nil
+}
+
+// silenceWav returns a canonical 44-byte-header PCM WAV holding duration
+// d of digital silence in the capture format (16kHz mono 16-bit). It is
+// only needed as valid whisper-cli input for the startup warm-up.
+func silenceWav(d time.Duration) []byte {
+	samples := int(d * 16000 / time.Second)
+	buf := make([]byte, 44+samples*2)
+	copy(buf[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(36+samples*2))
+	copy(buf[8:12], "WAVE")
+	copy(buf[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(buf[16:20], 16)
+	binary.LittleEndian.PutUint16(buf[20:22], 1) // PCM
+	binary.LittleEndian.PutUint16(buf[22:24], 1) // mono
+	binary.LittleEndian.PutUint32(buf[24:28], 16000)
+	binary.LittleEndian.PutUint32(buf[28:32], 32000) // byte rate
+	binary.LittleEndian.PutUint16(buf[32:34], 2)     // block align
+	binary.LittleEndian.PutUint16(buf[34:36], 16)    // bits per sample
+	copy(buf[36:40], "data")
+	binary.LittleEndian.PutUint32(buf[40:44], uint32(samples*2))
+	return buf
+}
+
+// warmupWhisper runs whisper-cli once on a second of digital silence
+// with the same flags as a real turn, so the whisper and VAD model loads
+// are paid at startup instead of delaying the first response after a
+// (re)start. The transcript is discarded; with --vad the silence is
+// dropped before inference and the result is empty.
+func warmupWhisper(config *Config) (time.Duration, error) {
+	start := time.Now()
+	_, err := sttWithWhisper(silenceWav(time.Second), config)
+	return time.Since(start), err
 }
 
 // buildLLMRequest assembles the chat-completions request body: system
@@ -852,6 +905,165 @@ func playAudio(audioData []byte) error {
 	return nil
 }
 
+// turnStats collects per-stage timings for one assistant turn so the
+// summary line can show where the seconds went: STT, LLM time-to-first-
+// token and total, TTS synthesis, time from capture end to the first
+// audio hitting the speaker, and playback drain. Writes come from the
+// SSE reader and the speaker's worker/player goroutines concurrently, so
+// every method takes the mutex. All methods accept a nil receiver -
+// turns like the reset ack run the same pipeline without a summary.
+type turnStats struct {
+	mu         sync.Mutex
+	procStart  time.Time // when processing began (right after capture)
+	stt        time.Duration
+	llmStart   time.Time
+	llmTTFT    time.Duration // request start -> first content token (streaming)
+	llmTotal   time.Duration // request start -> last token / full reply
+	ttsFirst   time.Duration // first sentence synthesis
+	ttsTotal   time.Duration // all synthesis
+	sentences  int
+	firstAudio time.Duration // procStart -> first playback start
+	playback   time.Duration // all playback
+	reasoning  int           // reasoning_content deltas seen in the stream
+}
+
+func newTurnStats() *turnStats {
+	return &turnStats{procStart: time.Now()}
+}
+
+func (t *turnStats) setSTT(d time.Duration) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.stt = d
+}
+
+func (t *turnStats) startLLM() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.llmStart = time.Now()
+}
+
+// firstToken records the LLM time-to-first-token once; the first content
+// delta is what gates the first spoken sentence.
+func (t *turnStats) firstToken() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.llmTTFT == 0 && !t.llmStart.IsZero() {
+		t.llmTTFT = time.Since(t.llmStart)
+	}
+}
+
+func (t *turnStats) doneLLM() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.llmStart.IsZero() {
+		t.llmTotal = time.Since(t.llmStart)
+	}
+}
+
+// sawReasoning counts reasoning_content deltas: they are not spoken, but
+// they delay the first content token when enable_thinking=false is not
+// honored by the server's chat template.
+func (t *turnStats) sawReasoning() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.reasoning++
+}
+
+func (t *turnStats) reasoningCount() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.reasoning
+}
+
+// noteSynth records one sentence synthesis (the first one separately -
+// it gates the first audio in non-streaming mode).
+func (t *turnStats) noteSynth(d time.Duration) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.sentences == 0 {
+		t.ttsFirst = d
+	}
+	t.sentences++
+	t.ttsTotal += d
+}
+
+// notePlaybackStart records the time from processing start (capture end)
+// to the first audio - the latency the user actually perceives, minus
+// the end-of-speech tail which is part of the capture.
+func (t *turnStats) notePlaybackStart() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.firstAudio == 0 {
+		t.firstAudio = time.Since(t.procStart)
+	}
+}
+
+func (t *turnStats) addPlayback(d time.Duration) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.playback += d
+}
+
+// summary renders the per-turn latency line. Stages that never ran
+// (nothing spoken, non-streaming LLM) are omitted or condensed.
+func (t *turnStats) summary(captureTime, totalTime time.Duration) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var b strings.Builder
+	fmt.Fprintf(&b, "Capture: %v", captureTime.Round(time.Millisecond))
+	if t.stt != 0 {
+		fmt.Fprintf(&b, " | STT: %v", t.stt.Round(time.Millisecond))
+	}
+	if t.llmTotal != 0 {
+		if t.llmTTFT != 0 {
+			fmt.Fprintf(&b, " | LLM: first token %v, total %v", t.llmTTFT.Round(time.Millisecond), t.llmTotal.Round(time.Millisecond))
+		} else {
+			fmt.Fprintf(&b, " | LLM: %v (whole reply)", t.llmTotal.Round(time.Millisecond))
+		}
+	}
+	if t.sentences > 0 {
+		fmt.Fprintf(&b, " | TTS: first %v, total %v (%d sentence%s)",
+			t.ttsFirst.Round(time.Millisecond), t.ttsTotal.Round(time.Millisecond),
+			t.sentences, map[bool]string{true: "", false: "s"}[t.sentences == 1])
+	}
+	if t.firstAudio != 0 {
+		fmt.Fprintf(&b, " | First audio: %v after capture end", t.firstAudio.Round(time.Millisecond))
+	}
+	if t.playback != 0 {
+		fmt.Fprintf(&b, " | Playback: %v", t.playback.Round(time.Millisecond))
+	}
+	fmt.Fprintf(&b, " | Total: %v", totalTime.Round(time.Millisecond))
+	return b.String()
+}
+
 // speaker pipelines TTS behind playback for one assistant response. A
 // TTS worker synthesizes sentences in order while a single player
 // goroutine plays them one at a time: synthesis of the next sentence
@@ -860,6 +1072,7 @@ func playAudio(audioData []byte) error {
 // text order.
 type speaker struct {
 	synth func(string) ([]byte, error)
+	stats *turnStats
 	texts chan string
 	wavs  chan []byte
 	wg    sync.WaitGroup
@@ -868,9 +1081,11 @@ type speaker struct {
 
 // newSpeaker starts the pipeline. synth is piperClient.synthesize for
 // the persistent process or a ttsWithPiper wrapper for the fallback.
-func newSpeaker(synth func(string) ([]byte, error)) *speaker {
+// stats (may be nil) collects TTS/playback/first-audio timings.
+func newSpeaker(synth func(string) ([]byte, error), stats *turnStats) *speaker {
 	s := &speaker{
 		synth: synth,
+		stats: stats,
 		texts: make(chan string, 8),
 		wavs:  make(chan []byte, 2),
 	}
@@ -878,6 +1093,7 @@ func newSpeaker(synth func(string) ([]byte, error)) *speaker {
 	go func() {
 		defer close(s.wavs)
 		for text := range s.texts {
+			synthStart := time.Now()
 			data, err := s.synth(text)
 			if err != nil {
 				// One failed sentence is skipped, not fatal: the rest
@@ -885,6 +1101,7 @@ func newSpeaker(synth func(string) ([]byte, error)) *speaker {
 				log.Printf("TTS failed: %v", err)
 				continue
 			}
+			s.stats.noteSynth(time.Since(synthStart))
 			s.wavs <- data
 		}
 	}()
@@ -893,9 +1110,12 @@ func newSpeaker(synth func(string) ([]byte, error)) *speaker {
 	go func() {
 		defer s.wg.Done()
 		for data := range s.wavs {
+			s.stats.notePlaybackStart()
+			playStart := time.Now()
 			if err := playAudio(data); err != nil {
 				log.Printf("Failed to play audio: %v", err)
 			}
+			s.stats.addPlayback(time.Since(playStart))
 		}
 	}()
 	return s
@@ -928,9 +1148,9 @@ func (s *speaker) closeAndWait() {
 }
 
 // speakResponse synthesizes and plays a complete response through the
-// pipeline (the non-streaming path).
-func speakResponse(text string, synth func(string) ([]byte, error)) {
-	s := newSpeaker(synth)
+// pipeline (the non-streaming path). stats may be nil.
+func speakResponse(text string, synth func(string) ([]byte, error), stats *turnStats) {
+	s := newSpeaker(synth, stats)
 	s.submit(cleanForTTS(text))
 	s.closeAndWait()
 }
@@ -1032,7 +1252,7 @@ func endsAbbreviation(text string) bool {
 // only after playback of the whole response has finished, so the caller
 // never starts capturing while the assistant is still speaking (the
 // mic would pick up the assistant's own voice).
-func callLLMStream(prompt string, config *Config, session *Session, piper *piperClient) (string, error) {
+func callLLMStream(prompt string, config *Config, session *Session, piper *piperClient, stats *turnStats) (string, error) {
 	reqBody, err := buildLLMRequest(prompt, config, session, true)
 	if err != nil {
 		return "", err
@@ -1041,6 +1261,7 @@ func callLLMStream(prompt string, config *Config, session *Session, piper *piper
 	// The timeout is an overall deadline: http.Client.Timeout covers
 	// headers through the last SSE event, so it bounds total generation
 	// time for the stream.
+	stats.startLLM()
 	client := &http.Client{Timeout: config.LLMTimeout}
 	resp, err := client.Post(
 		config.LLMEndpoint+"/v1/chat/completions",
@@ -1057,7 +1278,7 @@ func callLLMStream(prompt string, config *Config, session *Session, piper *piper
 		return "", fmt.Errorf("LLM returned status %d: %s", resp.StatusCode, string(body))
 	}
 
-	sp := newSpeaker(piper.synthesize)
+	sp := newSpeaker(piper.synthesize, stats)
 	var full strings.Builder
 	var partial string
 	reader := bufio.NewReader(resp.Body)
@@ -1086,13 +1307,21 @@ func callLLMStream(prompt string, config *Config, session *Session, piper *piper
 			var chunk struct {
 				Choices []struct {
 					Delta struct {
-						Content string `json:"content"`
+						Content          string `json:"content"`
+						ReasoningContent string `json:"reasoning_content"`
 					} `json:"delta"`
 					FinishReason string `json:"finish_reason"`
 				} `json:"choices"`
 			}
 			if json.Unmarshal([]byte(dataStr), &chunk) == nil && len(chunk.Choices) > 0 {
+				if reasoning := chunk.Choices[0].Delta.ReasoningContent; reasoning != "" {
+					// Not spoken, but it delays the first content token
+					// when the server's template ignores
+					// enable_thinking=false.
+					stats.sawReasoning()
+				}
 				if content := chunk.Choices[0].Delta.Content; content != "" {
+					stats.firstToken()
 					full.WriteString(content)
 					partial += content
 					var sentences []string
@@ -1117,6 +1346,11 @@ func callLLMStream(prompt string, config *Config, session *Session, piper *piper
 		sp.submit(rest)
 	}
 	sp.closeAndWait()
+	stats.doneLLM()
+
+	if n := stats.reasoningCount(); n > 0 {
+		log.Printf("LLM stream contained %d reasoning_content chunks; enable_thinking=false may not be honored by this server's chat template - reasoning delays the first spoken sentence", n)
+	}
 
 	content := strings.TrimSpace(full.String())
 	debugLog(config, fmt.Sprintf("LLM streaming response: %s", content))
@@ -1150,8 +1384,12 @@ func main() {
 		log.Println("LLM streaming enabled (sentence-chunked TTS)")
 	}
 	if config.CaptureMode == "vad" {
-		log.Printf("Capture: voice-activated (threshold %g%%, stop after %ss of silence, max utterance %ds)",
-			config.VadThreshold, soxDuration(config.VadSilenceSec), config.VadMaxUtteranceSec)
+		stop := fmt.Sprintf("%g%%", config.VadThreshold)
+		if config.VadStopThreshold > 0 {
+			stop = fmt.Sprintf("%g%%", config.VadStopThreshold)
+		}
+		log.Printf("Capture: voice-activated (start threshold %g%%, stop threshold %s, end-of-speech wait %ss, max utterance %ds)",
+			config.VadThreshold, stop, soxDuration(config.VadSilenceSec), config.VadMaxUtteranceSec)
 	} else {
 		log.Printf("Capture: fixed %ds window", config.CaptureSeconds)
 	}
@@ -1190,6 +1428,30 @@ func main() {
 		synthesize = piper.synthesize
 	}
 
+	// Pre-warm whisper with the same flags a real turn uses so the
+	// model load (whisper + VAD) is paid at startup, not by the first
+	// response after a (re)start - the same warm-up piper gets above.
+	if d, err := warmupWhisper(config); err != nil {
+		log.Printf("whisper warm-up failed: %v (the first turn pays the model load)", err)
+	} else {
+		log.Printf("whisper warm-up: %v (model load paid at startup)", d.Round(time.Millisecond))
+	}
+
+	// Graceful shutdown on SIGINT/SIGTERM: stop piper and exit cleanly.
+	// Without a handler the process dies on the signal and the exit
+	// code looks like a crash; child processes (sox, aplay) are torn
+	// down with the container's PID namespace regardless.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		log.Println("Shutting down...")
+		if piper != nil {
+			piper.stop()
+		}
+		os.Exit(0)
+	}()
+
 	for {
 		if config.CaptureMode == "vad" {
 			fmt.Println("Listening... (speak, then pause)")
@@ -1222,7 +1484,10 @@ func main() {
 
 		fmt.Println("Processing...")
 
+		stats := newTurnStats()
+		sttStart := time.Now()
 		text, err := sttWithWhisper(wavData, config)
+		stats.setSTT(time.Since(sttStart))
 		if err != nil {
 			log.Printf("STT failed: %v", err)
 			continue
@@ -1255,7 +1520,7 @@ func main() {
 			log.Println("Session reset by user")
 			response := "Session reset."
 			fmt.Printf("Assistant: %s\n", response)
-			speakResponse(response, synthesize)
+			speakResponse(response, synthesize, nil)
 			continue
 		}
 
@@ -1268,9 +1533,11 @@ func main() {
 		// gone quiet.
 		var response string
 		if config.LLMStream && piper != nil {
-			response, err = callLLMStream(text, config, session, piper)
+			response, err = callLLMStream(text, config, session, piper, stats)
 		} else {
+			stats.startLLM()
 			response, err = callLLM(text, config, session)
+			stats.doneLLM()
 		}
 		if err != nil {
 			log.Printf("LLM failed: %v", err)
@@ -1291,14 +1558,15 @@ func main() {
 		// For non-streaming mode, the whole reply is one submission to
 		// the same pipeline (streaming already spoke it above).
 		if !config.LLMStream || piper == nil {
-			speakResponse(response, synthesize)
+			speakResponse(response, synthesize, stats)
 		}
 
-		totalTime := time.Since(startTime)
-		fmt.Printf("Capture: %v | STT+LLM+TTS+playback: %v | Total: %v\n",
-			captureTime.Round(time.Millisecond),
-			(totalTime - captureTime).Round(time.Millisecond),
-			totalTime.Round(time.Millisecond))
+		// Per-stage breakdown: "First audio" (capture end -> first
+		// sample out of the speaker) is the latency the user perceives
+		// on top of the end-of-speech tail inside the capture time;
+		// playback is reported separately because it used to hide
+		// inside the old combined "processing" number.
+		fmt.Println(stats.summary(captureTime, time.Since(startTime)))
 		fmt.Println()
 	}
 	// piper.stop() is never reached (infinite loop); the process ends

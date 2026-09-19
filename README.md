@@ -76,7 +76,8 @@ Environment variables (all optional, see AGENTS.md for the full table):
 - `LLM_DISABLE_REASONING`: Disable thinking/reasoning mode via `chat_template_kwargs` `{"enable_thinking": false}` (honored by Qwen3-style templates; a thinking model otherwise burns the whole token budget and returns an empty answer) (default: on; set `false` to allow reasoning)
 - `LLM_MAX_TOKENS`: Token budget per reply (default: `512`; lower, e.g. `100`, to cap latency once reasoning is disabled)
 - `CAPTURE_MODE`: `vad` (voice-activated capture, default) or `fixed` (fixed window)
-- `VAD_THRESHOLD`: sox amplitude threshold in percent for speech start/stop (default: `10`; tune for your mic/room)
+- `VAD_THRESHOLD`: sox amplitude threshold in percent that starts the recording (default: `10`; tune for your mic/room)
+- `VAD_STOP_THRESHOLD`: sox amplitude threshold in percent that resets the end-of-speech counter (default: unset = same as `VAD_THRESHOLD`). In a noisy room set it above the noise peaks so blips cannot hold the recording open
 - `VAD_START_MS`: sound duration that starts the recording (default: `100`)
 - `VAD_SILENCE_SEC`: quiet duration that ends the utterance (default: `2.0`; lower = snappier but cuts off thinking pauses)
 - `VAD_MAX_UTTERANCE_SEC`: hard cap on one utterance (default: `30`)
@@ -116,11 +117,16 @@ docker compose up
 
 ## Performance Targets
 
-- **Total latency**: utterance length + ~2s end-of-speech wait + 3-4s processing
+- **Total latency**: utterance length + end-of-speech wait (`VAD_SILENCE_SEC`, default ~2s) + 3-4s processing
 - **Audio capture**: voice-activated; waiting for speech is free (sox blocks on the mic), no whisper inference burned on silence
 - **Whisper STT**: <1500ms (4 threads by default; raise `WHISPER_THREADS` to cut this)
 - **LLM inference**: <1500ms (via llama.cpp)
 - **Piper TTS**: <1000ms
+
+Every turn logs a per-stage breakdown (`STT`, `LLM first token/total`,
+`TTS`, `Playback`) plus **`First audio: X after capture end`** — the
+latency you actually perceive on top of the end-of-speech wait. If a
+turn feels slow, that line shows which stage to tune.
 
 ## Development
 
@@ -162,8 +168,20 @@ docker compose run --rm voice-assistant bash -c 'sox -d -r 16000 -c 1 -b 16 -t w
 ```
 
 If recording starts on background noise, or never starts on speech, tune
-`VAD_THRESHOLD` in `.env` (higher = less sensitive). `CAPTURE_MODE=fixed`
-restores the old fixed-window behavior while you experiment.
+`VAD_THRESHOLD` in `.env` (higher = less sensitive). If recordings keep
+running for seconds after you stop talking, background noise is resetting
+the end-of-speech counter: measure the noise floor and set
+`VAD_STOP_THRESHOLD` above its peaks:
+
+```bash
+docker compose run --rm voice-assistant bash -c 'sox -d -r 16000 -c 1 -b 16 /tmp/noise.wav trim 0 5 && sox /tmp/noise.wav -n stat'
+```
+
+The `Maximum amplitude` line (0-1 scale) times 100 is the noise peak in
+percent; set `VAD_STOP_THRESHOLD` comfortably above it while
+`VAD_THRESHOLD` stays low enough for quiet speech to start the recording.
+`CAPTURE_MODE=fixed` restores the old fixed-window behavior while you
+experiment.
 
 ### Model not found
 
