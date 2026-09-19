@@ -86,6 +86,9 @@ docker compose up -d
 | `VAD_SILENCE_SEC` | `2.0` | Quiet duration (s) below the threshold that ends the utterance |
 | `VAD_MAX_UTTERANCE_SEC` | `30` | Hard cap on one utterance (sox `trim`), so constant noise cannot record forever |
 | `VAD_MIN_SPEECH_MS` | `500` | Captures shorter than this are skipped before STT (transient noise, not speech) |
+| `SESSION_TIMEOUT_SEC` | `60` | Seconds of silence before the conversation history auto-resets; checked when the next capture ends (sox blocks in vad mode, so a between-iteration check would never fire). `0` disables the timeout |
+| `SESSION_MAX_MESSAGES` | `10` | Max messages kept in session history; must be even (oldest user/assistant pairs are trimmed) |
+| `SESSION_RESET_PHRASE` | `new voice assistant session` | Utterance that resets the session; matched case/punctuation-insensitively with room for ~2 padding words |
 | `WHISPER_VAD_MODEL` | `/models/whisper/ggml-silero-v5.1.2.bin` | whisper.cpp Silero VAD model (ggml); a missing file disables `--vad` |
 | `WHISPER_BIN` | `/app/whisper-cli` | whisper-cli binary path |
 | `PIPER_BIN` | `/app/piper` | piper binary path |
@@ -193,8 +196,17 @@ voice-assistant/
 - Strips bracketed non-speech tags (`[typing]`, `[SOUND]`, ...) whisper
   hallucinates on noise before `callLLM`; skips the turn when nothing real
   remains
-- POSTs to llama.cpp `/v1/chat/completions` (system + user message) with a
-  configurable timeout and status-code check
+- POSTs to llama.cpp `/v1/chat/completions` (system prompt + session
+  history + current utterance) with a configurable timeout and
+  status-code check
+- Keeps conversation history in a `Session`: only complete user/assistant
+  pairs are recorded (a failed LLM call records nothing, so the history
+  alternation never breaks), the oldest pairs are trimmed to
+  `SESSION_MAX_MESSAGES`, and the session is cleared by the
+  `SESSION_RESET_PHRASE` utterance (word-boundary match, ~2 padding words
+  allowed) or after `SESSION_TIMEOUT_SEC` without speech - checked after
+  each capture ends, because sox blocks in vad mode and a between-iteration
+  check would never fire for a returning user
 - Sends `LLM_MODEL` in the request body: required when the llama.cpp
   server runs in router mode (`--models-dir`/`--model-presets`), which
   rejects requests without a model name; single-model servers ignore it
@@ -246,8 +258,9 @@ voice-assistant/
   audio group is added via `group_add: ${AUDIO_GID:-29}` for `/dev/snd`
   access, and model installs use `--user 0` (see Build Instructions)
 - `LLM_ENDPOINT`, `LLM_MODEL`, `LLM_SYSTEM_PROMPT`, `LLM_DISABLE_REASONING`,
-  `LLM_MAX_TOKENS`, `WHISPER_THREADS`, `WHISPER_VAD_MODEL` and the
-  `CAPTURE_MODE`/`VAD_*` capture variables are passed through in
+  `LLM_MAX_TOKENS`, `WHISPER_THREADS`, `WHISPER_VAD_MODEL`, the
+  `CAPTURE_MODE`/`VAD_*` capture variables and the `SESSION_*` session
+  variables are passed through in
   docker-compose.yml (e.g. `${LLM_ENDPOINT:-http://host.docker.internal:8080}`),
   so they can be overridden via host env vars or a `.env` file (see
   `.env.example`)

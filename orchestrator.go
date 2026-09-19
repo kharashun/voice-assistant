@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 type ChatMessage struct {
@@ -40,6 +41,89 @@ type LLMResponse struct {
 	} `json:"choices"`
 }
 
+type Session struct {
+	messages    []ChatMessage
+	lastSpeech  time.Time
+	maxMessages int
+}
+
+func newSession(maxMessages int) *Session {
+	return &Session{
+		messages:    nil,
+		lastSpeech:  time.Now(),
+		maxMessages: maxMessages,
+	}
+}
+
+func (s *Session) reset() {
+	s.messages = nil
+	s.lastSpeech = time.Now()
+}
+
+// trim drops the oldest user/assistant pairs so the history stays within
+// maxMessages. Turns are appended as pairs, so removing two at a time
+// keeps the user/assistant alternation intact.
+func (s *Session) trim() {
+	for len(s.messages) > s.maxMessages {
+		s.messages = s.messages[2:]
+	}
+}
+
+// appendTurn records a completed exchange. Only successful turns are
+// stored, so a failed LLM call never leaves an unanswered user message
+// in the history.
+func (s *Session) appendTurn(userMsg, assistantMsg string) {
+	s.messages = append(s.messages, ChatMessage{Role: "user", Content: userMsg})
+	s.messages = append(s.messages, ChatMessage{Role: "assistant", Content: assistantMsg})
+	s.trim()
+}
+
+// normalizeUtterance lowercases text and re-joins the words it contains
+// with single spaces, dropping everything else (punctuation, hyphens).
+// This absorbs whisper's transcription quirks ("New voice-assistant
+// session.") before phrase matching.
+func normalizeUtterance(text string) string {
+	words := strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	return strings.Join(words, " ")
+}
+
+// isResetCommand reports whether an utterance is the session-reset
+// command: the phrase must appear as whole words, and the utterance may
+// carry at most two padding words ("um", "please") around it, so a longer
+// sentence that merely mentions the phrase does not wipe the conversation.
+func isResetCommand(text, phrase string) bool {
+	normalized := normalizeUtterance(text)
+	phraseWords := normalizeUtterance(phrase)
+	if phraseWords == "" {
+		return false
+	}
+	if !strings.Contains(" "+normalized+" ", " "+phraseWords+" ") {
+		return false
+	}
+	return len(strings.Fields(normalized)) <= len(strings.Fields(phraseWords))+2
+}
+
+// checkSessionTimeout clears the session when the user has been silent
+// longer than the configured timeout. It runs right after each capture,
+// before the audio is processed: in vad mode the capture itself blocks
+// for an unbounded time waiting for speech, so a check between loop
+// iterations would never fire for a returning user, whose utterance would
+// then be answered with a stale conversation. A timeout <= 0 disables the
+// check; an already-empty session is left alone so an idle assistant
+// does not log spurious resets.
+func checkSessionTimeout(session *Session, config *Config) {
+	if config.SessionTimeoutSec <= 0 || len(session.messages) == 0 {
+		return
+	}
+	if time.Since(session.lastSpeech) > time.Duration(config.SessionTimeoutSec)*time.Second {
+		log.Println("Session timeout - resetting conversation")
+		session.reset()
+		fmt.Println("Session timed out - conversation cleared.")
+	}
+}
+
 type Config struct {
 	WhisperBin          string
 	WhisperModel        string
@@ -61,6 +145,9 @@ type Config struct {
 	VadSilenceSec       float64 // quiet duration that ends the recording
 	VadMaxUtteranceSec  int     // hard cap on utterance length
 	VadMinSpeechMs      int     // captures shorter than this are skipped before STT
+	SessionTimeoutSec   int     // seconds of silence before auto-reset (0 = disabled)
+	SessionMaxMessages  int     // max messages kept in session history (even)
+	SessionResetPhrase  string  // utterance that resets the session
 	Debug               bool
 }
 
@@ -126,6 +213,17 @@ func loadConfig() *Config {
 		vadMinSpeechMs = 500
 	}
 
+	// 0 disables the idle timeout; negatives and garbage fall back to 60s.
+	sessionTimeoutSec, err := strconv.Atoi(getenv("SESSION_TIMEOUT_SEC", "60"))
+	if err != nil || sessionTimeoutSec < 0 {
+		sessionTimeoutSec = 60
+	}
+
+	sessionMaxMessages, err := strconv.Atoi(getenv("SESSION_MAX_MESSAGES", "10"))
+	if err != nil || sessionMaxMessages <= 0 || sessionMaxMessages%2 != 0 {
+		sessionMaxMessages = 10
+	}
+
 	return &Config{
 		WhisperBin:          getenv("WHISPER_BIN", "/app/whisper-cli"),
 		WhisperModel:        getenv("WHISPER_MODEL", "/models/whisper/ggml-small.en-q5_1.bin"),
@@ -147,6 +245,9 @@ func loadConfig() *Config {
 		VadSilenceSec:       vadSilenceSec,
 		VadMaxUtteranceSec:  vadMaxUtteranceSec,
 		VadMinSpeechMs:      vadMinSpeechMs,
+		SessionTimeoutSec:   sessionTimeoutSec,
+		SessionMaxMessages:  sessionMaxMessages,
+		SessionResetPhrase:  getenv("SESSION_RESET_PHRASE", "new voice assistant session"),
 		Debug:               os.Getenv("DEBUG") == "true",
 	}
 }
@@ -323,10 +424,14 @@ func sttWithWhisper(wavData []byte, config *Config) (string, error) {
 	return text, nil
 }
 
-func buildLLMRequest(prompt string, config *Config) (*bytes.Buffer, error) {
-	messages := make([]ChatMessage, 0, 2)
+func buildLLMRequest(prompt string, config *Config, session *Session) (*bytes.Buffer, error) {
+	// System prompt + trimmed history + the current utterance.
+	messages := make([]ChatMessage, 0, len(session.messages)+2)
 	if config.LLMSystemPrompt != "" {
 		messages = append(messages, ChatMessage{Role: "system", Content: config.LLMSystemPrompt})
+	}
+	for _, m := range session.messages {
+		messages = append(messages, m)
 	}
 	messages = append(messages, ChatMessage{Role: "user", Content: prompt})
 
@@ -347,8 +452,8 @@ func buildLLMRequest(prompt string, config *Config) (*bytes.Buffer, error) {
 	return bytes.NewBuffer(jsonData), nil
 }
 
-func callLLM(prompt string, config *Config) (string, error) {
-	reqBody, err := buildLLMRequest(prompt, config)
+func callLLM(prompt string, config *Config, session *Session) (string, error) {
+	reqBody, err := buildLLMRequest(prompt, config, session)
 	if err != nil {
 		return "", err
 	}
@@ -482,7 +587,15 @@ func main() {
 		log.Printf("Capture: fixed %ds window", config.CaptureSeconds)
 	}
 
-	fmt.Println("Voice Assistant ready! Press Ctrl+C to exit.")
+	session := newSession(config.SessionMaxMessages)
+	if config.SessionTimeoutSec > 0 {
+		log.Printf("Session: %d-message history, %ds idle timeout, reset command: '%s'",
+			config.SessionMaxMessages, config.SessionTimeoutSec, config.SessionResetPhrase)
+	} else {
+		log.Printf("Session: %d-message history, idle timeout disabled, reset command: '%s'",
+			config.SessionMaxMessages, config.SessionResetPhrase)
+	}
+	fmt.Printf("Voice Assistant ready! Say '%s' to reset the conversation.\n", config.SessionResetPhrase)
 	fmt.Println()
 
 	for {
@@ -498,12 +611,15 @@ func main() {
 		wavData, err := captureAudio(config)
 		if err != nil {
 			log.Printf("Failed to capture audio: %v", err)
-			// Back off so a persistently unavailable mic (busy device,
-			// hot-unplug) cannot spin this loop hot.
 			time.Sleep(time.Second)
 			continue
 		}
 		captureTime := time.Since(startTime)
+
+		// The capture can block for a long time waiting for speech, so
+		// the idle timeout is re-checked here, before the new utterance
+		// is answered with a possibly stale conversation.
+		checkSessionTimeout(session, config)
 
 		// In vad mode a too-short capture is a transient that started
 		// the recording but contains no speech - skip STT entirely.
@@ -541,7 +657,31 @@ func main() {
 			}
 		}
 
-		response, err := callLLM(text, config)
+		// Check for the session reset command.
+		if isResetCommand(text, config.SessionResetPhrase) {
+			session.reset()
+			log.Println("Session reset by user")
+			response := "Session reset."
+			fmt.Printf("Assistant: %s\n", response)
+
+			audioData, err := ttsWithPiper(response, config)
+			if err != nil {
+				log.Printf("TTS failed: %v", err)
+			} else {
+				fmt.Println("Speaking...")
+				err = playAudio(audioData)
+				if err != nil {
+					log.Printf("Failed to play audio: %v", err)
+				}
+			}
+			continue
+		}
+
+		session.lastSpeech = time.Now()
+
+		// callLLM appends the current utterance to the request itself;
+		// the turn is recorded in the history only after a reply.
+		response, err := callLLM(text, config, session)
 		if err != nil {
 			log.Printf("LLM failed: %v", err)
 			continue
@@ -553,6 +693,8 @@ func main() {
 			fmt.Println("No response. Listening again...")
 			continue
 		}
+
+		session.appendTurn(text, response)
 
 		audioData, err := ttsWithPiper(response, config)
 		if err != nil {

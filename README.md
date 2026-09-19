@@ -7,6 +7,7 @@ A low-latency voice assistant with speech-to-text (STT), LLM processing, and tex
 - **Speech-to-Text**: whisper.cpp (CPU, small.en-q5_1 model)
 - **Voice-activated capture**: sox `silence` effect — the assistant waits for speech, records your utterance, and stops ~2s after you pause (no fixed window, no timing your speech)
 - **Noise robustness**: whisper.cpp's built-in Silero VAD drops non-speech segments (keyboard/background noise) before transcription
+- **Conversation memory**: recent turns are kept as context for the LLM; say the reset phrase (default: `new voice assistant session`), go silent for `SESSION_TIMEOUT_SEC`, or let the history trim itself
 - **LLM Processing**: Calls local llama.cpp API
 - **Text-to-Speech**: piper (C++ CLI, built from source)
 - **Total Latency**: utterance + ~2s end-of-speech wait + 3-4s processing (target)
@@ -78,6 +79,9 @@ Environment variables (all optional, see AGENTS.md for the full table):
 - `VAD_SILENCE_SEC`: quiet duration that ends the utterance (default: `2.0`; lower = snappier but cuts off thinking pauses)
 - `VAD_MAX_UTTERANCE_SEC`: hard cap on one utterance (default: `30`)
 - `VAD_MIN_SPEECH_MS`: captures shorter than this are skipped before STT (default: `500`)
+- `SESSION_TIMEOUT_SEC`: seconds of silence before the conversation history auto-resets, checked when the next capture ends; `0` disables (default: `60`)
+- `SESSION_MAX_MESSAGES`: max messages kept as conversation context; must be even (default: `10`)
+- `SESSION_RESET_PHRASE`: utterance that resets the conversation, matched case/punctuation-insensitively with room for a couple of padding words (default: `new voice assistant session`)
 - `CAPTURE_SECONDS`: fixed capture window in seconds for `CAPTURE_MODE=fixed` (default: `5`)
 - `DEBUG`: Enable debug logging (default: `false`)
 - `AUDIO_GID`: Host audio group GID for `/dev/snd` access as the non-root container user (default: `29`)
